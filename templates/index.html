@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GigaChat Assistant</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div class="page">
+    <header class="header">
+      <div>
+        <h1 class="title">Помощник на все руки</h1>
+        <p class="subtitle">Веб-версия помощника на базе GigaChat</p>
+      </div>
+    </header>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        <div class="flash-list">
+          {% for category, message in messages %}
+            <div class="flash flash-{{ category }}">{{ message }}</div>
+          {% endfor %}
+        </div>
+      {% endif %}
+    {% endwith %}
+
+    <main class="content">
+      <section class="chat-panel">
+        <div class="chat-card rounded-card">
+          {% if history %}
+            <div class="chat-log" id="chat-log">
+              {% for item in history %}
+                {% if item.role == 'assistant' %}
+                  <div class="bubble bubble-{{ item.role }}">
+                    <div class="bubble-meta">
+                      Архитектор
+                    </div>
+                    <div class="bubble-text">{{ (item.content or '') | striptags | replace('\n', '<br>') | safe }}</div>
+                    {% if item.meta %}
+                      <div class="bubble-meta-details">
+                        {% if item.meta.provider and item.meta.model and item.meta.provider in providers %}
+                          <div class="meta-row">
+                            <span class="meta-label">{{ providers[item.meta.provider].title }} • {{ item.meta.model }}</span>
+                          </div>
+                        {% endif %}
+                        <div class="meta-row">
+                          {% if item.meta.elapsed is not none %}
+                            <span>⏱ {{ item.meta.elapsed | float | round(2) }} c</span>
+                          {% endif %}
+                          {% if item.meta.total_tokens is not none %}
+                            <span>🔢 {{ item.meta.total_tokens }} ток.</span>
+                          {% elif item.meta.prompt_tokens is not none or item.meta.completion_tokens is not none %}
+                            {% if item.meta.prompt_tokens is not none %}
+                              <span>📥 {{ item.meta.prompt_tokens }} ток.</span>
+                            {% endif %}
+                            {% if item.meta.completion_tokens is not none %}
+                              <span>📤 {{ item.meta.completion_tokens }} ток.</span>
+                            {% endif %}
+                          {% endif %}
+                          {% if item.meta.cost is defined and item.meta.cost is not none %}
+                            <span class="meta-cost">💰 {{ item.meta.cost | round(6) }} ₽</span>
+                          {% endif %}
+                        </div>
+                      </div>
+                    {% endif %}
+                  </div>
+                {% else %}
+                  <div class="bubble bubble-{{ item.role }}">
+                    <div class="bubble-meta">
+                      Вы
+                    </div>
+                    <div class="bubble-text">{{ (item.content or '') | striptags | replace('\n', '<br>') | safe }}</div>
+                    {% if item.meta %}
+                      <div class="bubble-meta-details">
+                        {% if item.meta.tokens is not none %}
+                          <span>🔢 {{ item.meta.tokens }} ток.</span>
+                        {% endif %}
+                        {% if item.meta.request_tokens is not none %}
+                          <span>📊 {{ item.meta.request_tokens }} ток. в запросе</span>
+                        {% endif %}
+                      </div>
+                    {% endif %}
+                  </div>
+                {% endif %}
+              {% endfor %}
+            </div>
+          {% else %}
+            <div class="chat-empty">
+              <p>Начните диалог — задайте первый вопрос или опишите задачу.</p>
+            </div>
+          {% endif %}
+        </div>
+
+        <form method="post" class="composer-bar rounded-card" id="composer-form">
+          <input type="hidden" name="preset" id="composer-preset" value="{{ state.preset_key }}">
+          <input type="hidden" name="provider" id="composer-provider" value="{{ state.provider }}">
+          <input type="hidden" name="model" id="composer-model" value="{{ state.model }}">
+          <input type="hidden" name="temperature" id="composer-temperature" value="{{ '%.2f'|format(state.temperature) }}">
+
+          <div class="composer-input-wrapper">
+            <textarea
+              name="message"
+              class="composer-bar-input"
+              id="composer-message"
+              rows="1"
+              placeholder="Напишите сообщение..."
+            ></textarea>
+            <div class="composer-tokens" id="composer-tokens">
+              <span class="tokens-count">0 ток.</span>
+            </div>
+          </div>
+          <button type="submit" name="action" value="send" class="composer-send" title="Отправить">
+            ➤
+          </button>
+          <button type="submit" name="action" value="reset" class="btn tiny">Сбросить</button>
+        </form>
+      </section>
+
+      <section class="controls rounded-card">
+        <form method="post" class="controls-form">
+          <div class="field-grid">
+            <div class="field">
+              <label for="provider">Провайдер</label>
+              <select id="provider" name="provider" class="input">
+                {% for key, provider in providers.items() %}
+                  <option value="{{ key }}" {% if key == state.provider %}selected{% endif %}>
+                    {{ provider.title }}
+                  </option>
+                {% endfor %}
+              </select>
+            </div>
+
+            <div class="field">
+              <label for="preset">Предустановка</label>
+              <select id="preset" name="preset" class="input">
+                {% for key, preset in presets.items() %}
+                  <option value="{{ key }}" {% if key == state.preset_key %}selected{% endif %}>
+                    {{ preset.name }}
+                  </option>
+                {% endfor %}
+              </select>
+            </div>
+
+            <div class="field">
+              <label for="model">Модель</label>
+              <select id="model" name="model" class="input">
+                {% for model_key, model_info in models.items() %}
+                  <option value="{{ model_key }}" {% if model_key == state.model %}selected{% endif %}>
+                    {{ model_info.label }}
+                  </option>
+                {% endfor %}
+              </select>
+            </div>
+
+            <div class="field">
+              <label for="temperature">Температура (0.00 – 2.00)</label>
+              <input
+                id="temperature"
+                name="temperature"
+                type="number"
+                class="input"
+                min="0"
+                max="2"
+                step="0.05"
+                value="{{ '%.2f'|format(state.temperature) }}"
+              >
+            </div>
+          </div>
+
+          <section class="prompt-preview">
+            <div class="preview-header">
+              <h2>Текущий системный промпт</h2>
+              <span class="current-model">{{ providers[state.provider].title }} • {{ models[state.model].label }}</span>
+            </div>
+            <div class="prompt-text rounded-card" id="prompt-preview">
+              {{ presets[state.preset_key].prompt | e | replace('\n', '<br>') | safe }}
+            </div>
+          </section>
+
+          <div class="preset-action">
+            <button type="button" class="btn tiny" id="open-preset-modal">Сохранить предустановку</button>
+          </div>
+
+        </form>
+      </section>
+    </main>
+  </div>
+
+  <div class="modal-backdrop" id="preset-modal-backdrop">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>Сохранить предустановку</h3>
+        <button type="button" class="modal-close" id="close-preset-modal">×</button>
+      </div>
+      <form method="post" class="modal-form" id="preset-modal-form">
+        <input type="hidden" name="preset" id="modal-preset" value="{{ state.preset_key }}">
+        <input type="hidden" name="provider" id="modal-provider" value="{{ state.provider }}">
+        <input type="hidden" name="model" id="modal-model" value="{{ state.model }}">
+        <input type="hidden" name="temperature" id="modal-temperature" value="{{ '%.2f'|format(state.temperature) }}">
+
+        <div class="field">
+          <label for="modal_preset_title">Название</label>
+          <input
+            id="modal_preset_title"
+            name="preset_title"
+            class="input"
+            type="text"
+            placeholder="Например: Архитектор — быстрый режим"
+          >
+        </div>
+        <div class="field">
+          <label for="modal_preset_prompt">Текст промпта</label>
+          <textarea
+            id="modal_preset_prompt"
+            name="preset_prompt"
+            class="input textarea"
+            rows="8"
+            placeholder="Введите системный промпт для новой предустановки"
+          >{{ presets[state.preset_key].prompt | trim }}</textarea>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn secondary" id="modal-use-current">Заполнить текущим</button>
+          <div class="modal-action-buttons">
+            <button type="button" class="btn link" id="modal-cancel">Отмена</button>
+            <button type="submit" name="action" value="save_preset" class="btn primary small">Сохранить</button>
+          </div>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    function scrollToBottom() {
+      const chatLog = document.getElementById('chat-log');
+      if (chatLog) {
+        chatLog.scrollTo({
+          top: chatLog.scrollHeight,
+          behavior: 'smooth'
+        });
+      }
+    }
+
+    // Прокрутка при загрузке страницы
+    window.addEventListener('load', () => {
+      setTimeout(scrollToBottom, 100);
+    });
+
+    // Прокрутка после DOMContentLoaded
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', scrollToBottom);
+    } else {
+      scrollToBottom();
+    }
+
+    const presetsData = {{ presets | tojson | safe }};
+    const providersData = {{ providers | tojson | safe }};
+    const providerSelect = document.getElementById('provider');
+    const presetSelect = document.getElementById('preset');
+    const modelSelect = document.getElementById('model');
+    const temperatureInput = document.getElementById('temperature');
+
+    const composerForm = document.getElementById('composer-form');
+    const composerPreset = document.getElementById('composer-preset');
+    const composerProvider = document.getElementById('composer-provider');
+    const composerModel = document.getElementById('composer-model');
+    const composerTemperature = document.getElementById('composer-temperature');
+    const composerInput = document.getElementById('composer-message');
+    const composerTokens = document.getElementById('composer-tokens');
+    const tokensCountSpan = composerTokens ? composerTokens.querySelector('.tokens-count') : null;
+
+    const promptPreview = document.getElementById('prompt-preview');
+    const currentModelBadge = document.querySelector('.current-model');
+
+    const presetModalBackdrop = document.getElementById('preset-modal-backdrop');
+    const presetModalForm = document.getElementById('preset-modal-form');
+    const openPresetModalBtn = document.getElementById('open-preset-modal');
+    const closePresetModalBtn = document.getElementById('close-preset-modal');
+    const modalUseCurrentBtn = document.getElementById('modal-use-current');
+    const modalPresetInput = document.getElementById('modal-preset');
+    const modalProviderInput = document.getElementById('modal-provider');
+    const modalModelInput = document.getElementById('modal-model');
+    const modalTemperatureInput = document.getElementById('modal-temperature');
+    const modalPresetPromptInput = document.getElementById('modal_preset_prompt');
+
+    function formatPromptHTML(text) {
+      return text ? text.replace(/\n/g, '<br>') : '';
+    }
+
+    // Подсчет токенов (аналогично estimate_tokens в Python: ~1 токен = 4 символа)
+    function estimateTokens(text) {
+      if (!text || text.trim().length === 0) return 0;
+      return Math.max(1, Math.floor(text.length / 4));
+    }
+
+    // Обновление отображения токенов
+    function updateTokensCount() {
+      if (!composerInput || !tokensCountSpan) return;
+      const text = composerInput.value || '';
+      const tokens = estimateTokens(text);
+      tokensCountSpan.textContent = `${tokens} ток.`;
+    }
+
+    function updateModelOptions() {
+      if (!providerSelect || !modelSelect) return;
+      const providerKey = providerSelect.value;
+      const provider = providersData[providerKey] || { models: {} };
+      const modelsMap = provider.models || {};
+      const previousValue = modelSelect.value;
+      let firstValue = null;
+
+      modelSelect.innerHTML = '';
+      Object.entries(modelsMap).forEach(([value, meta]) => {
+        if (firstValue === null) firstValue = value;
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = meta.label || value;
+        if (value === previousValue) option.selected = true;
+        modelSelect.appendChild(option);
+      });
+
+      if (!modelsMap[previousValue] && firstValue) {
+        modelSelect.value = firstValue;
+      }
+    }
+
+    function updatePromptPreview() {
+      const preset = presetsData[presetSelect.value];
+      if (preset && promptPreview) {
+        promptPreview.innerHTML = formatPromptHTML(preset.prompt);
+      }
+    }
+
+    function updateBadges() {
+      if (!currentModelBadge) return;
+      const provider = providersData[providerSelect.value] || {};
+      const modelsMap = provider.models || {};
+      const providerTitle = provider.title || providerSelect.value;
+      const modelMeta = modelsMap[modelSelect.value] || {};
+      const modelTitle = modelMeta.label || modelSelect.value;
+      currentModelBadge.textContent = `${providerTitle} • ${modelTitle}`;
+    }
+
+    function syncHiddenFields() {
+      if (composerPreset) composerPreset.value = presetSelect.value;
+      if (composerProvider) composerProvider.value = providerSelect.value;
+      if (composerModel) composerModel.value = modelSelect.value;
+      if (composerTemperature) composerTemperature.value = temperatureInput.value;
+
+      if (modalPresetInput) modalPresetInput.value = presetSelect.value;
+      if (modalProviderInput) modalProviderInput.value = providerSelect.value;
+      if (modalModelInput) modalModelInput.value = modelSelect.value;
+      if (modalTemperatureInput) modalTemperatureInput.value = temperatureInput.value;
+    }
+
+    function syncAll() {
+      updateModelOptions();
+      updatePromptPreview();
+      updateBadges();
+      syncHiddenFields();
+    }
+
+    if (providerSelect) providerSelect.addEventListener('change', syncAll);
+    if (presetSelect) presetSelect.addEventListener('change', syncAll);
+    if (modelSelect) modelSelect.addEventListener('change', syncAll);
+    if (temperatureInput) temperatureInput.addEventListener('input', syncAll);
+    if (composerForm) composerForm.addEventListener('submit', syncHiddenFields);
+
+    function openPresetModal() {
+      if (!presetModalBackdrop) return;
+      syncAll();
+      if (modalPresetPromptInput) {
+        const preset = presetsData[presetSelect.value];
+        modalPresetPromptInput.value = preset ? preset.prompt : '';
+        modalPresetPromptInput.dataset.dirty = '0';
+      }
+      presetModalBackdrop.classList.add('is-open');
+    }
+
+    function closePresetModal() {
+      if (presetModalBackdrop) {
+        presetModalBackdrop.classList.remove('is-open');
+      }
+    }
+
+    if (openPresetModalBtn) openPresetModalBtn.addEventListener('click', openPresetModal);
+    if (closePresetModalBtn) closePresetModalBtn.addEventListener('click', closePresetModal);
+    if (presetModalBackdrop) {
+      presetModalBackdrop.addEventListener('click', (event) => {
+        if (event.target === presetModalBackdrop) closePresetModal();
+      });
+    }
+
+    if (modalUseCurrentBtn && modalPresetPromptInput) {
+      modalUseCurrentBtn.addEventListener('click', (event) => {
+        event.preventDefault();
+        const preset = presetsData[presetSelect.value];
+        if (preset) {
+          modalPresetPromptInput.value = preset.prompt;
+          modalPresetPromptInput.dataset.dirty = '0';
+        }
+      });
+    }
+
+    if (modalPresetPromptInput) {
+      modalPresetPromptInput.addEventListener('input', () => {
+        modalPresetPromptInput.dataset.dirty = '1';
+      });
+    }
+
+    if (presetModalForm) presetModalForm.addEventListener('submit', syncHiddenFields);
+
+    syncAll();
+
+    function autoResizeTextarea() {
+      if (!composerInput) return;
+      
+      // Сбрасываем высоту для правильного расчета scrollHeight
+      composerInput.style.height = 'auto';
+      
+      // Получаем высоту одной строки
+      const computedStyle = window.getComputedStyle(composerInput);
+      const fontSize = parseFloat(computedStyle.fontSize) || 15;
+      const lineHeightValue = computedStyle.lineHeight;
+      
+      // Если line-height задан в em (например, 1.5), вычисляем в пикселях
+      let lineHeight;
+      if (lineHeightValue.includes('em')) {
+        const emValue = parseFloat(lineHeightValue);
+        lineHeight = fontSize * emValue;
+      } else {
+        lineHeight = parseFloat(lineHeightValue) || fontSize * 1.5;
+      }
+      
+      // Максимальная высота для 12 строк
+      const maxLines = 12;
+      const maxHeight = lineHeight * maxLines;
+      
+      // Текущая высота контента (scrollHeight включает padding)
+      const scrollHeight = composerInput.scrollHeight;
+      
+      // Устанавливаем высоту
+      if (scrollHeight <= maxHeight) {
+        // Контент помещается в 12 строк - используем высоту контента
+        composerInput.style.height = scrollHeight + 'px';
+        composerInput.style.overflowY = 'hidden';
+      } else {
+        // Контент превышает 12 строк - устанавливаем максимальную высоту и показываем прокрутку
+        composerInput.style.height = maxHeight + 'px';
+        composerInput.style.overflowY = 'auto';
+      }
+    }
+
+    if (composerInput) {
+      // Инициализация при загрузке
+      updateTokensCount();
+      
+      // Обработчик ввода текста
+      composerInput.addEventListener('input', () => {
+        autoResizeTextarea();
+        updateTokensCount();
+      });
+      
+      // Обработчик загрузки страницы
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', () => {
+          autoResizeTextarea();
+          updateTokensCount();
+        });
+      } else {
+        // DOM уже загружен
+        setTimeout(() => {
+          autoResizeTextarea();
+          updateTokensCount();
+        }, 0);
+      }
+      
+      // Также обрабатываем событие load на случай, если DOM загрузился позже
+      window.addEventListener('load', () => {
+        autoResizeTextarea();
+        updateTokensCount();
+      });
+    }
+  </script>
+</body>
+</html>
+
