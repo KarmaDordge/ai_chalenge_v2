@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>История диалогов</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div class="page">
+    <header class="header">
+      <div>
+        <h1 class="title">История диалогов</h1>
+        <p class="subtitle">Все сохраненные сессии чатов</p>
+      </div>
+      <nav>
+        <a href="{{ url_for('index') }}" class="btn tiny">Назад к чату</a>
+      </nav>
+    </header>
+
+    <main class="content">
+      <section class="controls rounded-card" style="width: 100%;">
+        {% if sessions %}
+          <div class="field">
+            <ul>
+              {% for s in sessions %}
+                <li style="margin: 8px 0;">
+                  <a href="{{ url_for('history_view', session_uuid=s.session_uuid) }}" class="link">
+                    {{ s.title }}
+                  </a>
+                  <span style="margin-left: 8px; color: #888;">
+                    • сообщений: {{ s.messages_count }}
+                  </span>
+                </li>
+              {% endfor %}
+            </ul>
+          </div>
+        {% else %}
+          <div class="field">
+            <p>Пока нет сохраненных сессий.</p>
+          </div>
+        {% endif %}
+      </section>
+    </main>
+  </div>
+</body>
+</html>
+
+

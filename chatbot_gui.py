@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sqlite3
 import re
 import time
 import traceback
@@ -17,6 +18,7 @@ import requests
 from dotenv import load_dotenv
 from flask import (
     Flask,
+    g,
     flash,
     get_flashed_messages,
     redirect,
@@ -28,6 +30,36 @@ from flask import (
 from gigachat import GigaChat
 from gigachat.models import Chat, Messages, MessagesRole
 from huggingface_hub import InferenceClient
+from gigachat_client import ask_gigachat
+
+# Утилиты, вынесенные в отдельный модуль
+from chat_utils import (
+    slugify as cu_slugify,
+    default_model_for as cu_default_model_for,
+    default_chat_state as cu_default_chat_state,
+    parse_temperature,
+    estimate_tokens as cu_estimate_tokens,
+    estimate_request_tokens as cu_estimate_request_tokens,
+    calculate_gigachat_cost as cu_calculate_gigachat_cost,
+    validate_history_entry as cu_validate_history_entry,
+    extract_tokens_from_usage as cu_extract_tokens_from_usage,
+    create_meta_dict as cu_create_meta_dict,
+    handle_hf_http_error as cu_handle_hf_http_error,
+    handle_hf_response_error as cu_handle_hf_response_error,
+)
+from db_utils import (
+    get_db as db_get_db,
+    close_db as db_close_db,
+    db_ensure_session,
+    db_add_message,
+    db_clear_session,
+    db_wal_checkpoint,
+    db_list_sessions,
+    db_get_messages,
+    db_load_presets,
+    db_upsert_preset,
+    make_unique_preset_key,
+)
 
 # Настраиваем переменные окружения
 load_dotenv()
@@ -35,6 +67,7 @@ load_dotenv()
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 CONFIG_DIR = os.path.join(BASE_DIR, "config")
 HISTORY_DIR = os.path.join(BASE_DIR, "chat_history")
+DB_PATH = os.path.join(HISTORY_DIR, "chat_history.db")
 PROMPTS_FILE_PATH = os.path.join(CONFIG_DIR, "preset_prompts.json")
 PROMPT_NAMES_FILE_PATH = os.path.join(CONFIG_DIR, "preset_prompt_names.json")
 
@@ -110,180 +143,113 @@ SESSION_ID_KEY = "chat_session_id"  # ID сессии для файлового 
 
 
 # ---------------------------------------------------------------------------
-# Функции для работы с файловым хранилищем истории
+# Идентификатор сессии (используется для привязки истории в БД)
 # ---------------------------------------------------------------------------
 
 
 def _get_session_id() -> str:
-    """Получает или создает ID сессии для файлового хранилища."""
+    """Получает или создает UUID сессии (используется для строк в БД)."""
     if SESSION_ID_KEY not in session:
         import uuid
         session[SESSION_ID_KEY] = str(uuid.uuid4())
         session.modified = True
     return session[SESSION_ID_KEY]
 
-
-def _get_history_file_path(session_id: str) -> str:
-    """Возвращает путь к файлу истории для данной сессии."""
-    return os.path.join(HISTORY_DIR, f"{session_id}.json")
-
-
-def _load_history_from_file(session_id: str) -> List[Dict[str, str]]:
-    """Загружает историю чата из файла."""
-    file_path = _get_history_file_path(session_id)
-    if not os.path.exists(file_path):
-        return []
-    
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if isinstance(data, list):
-                return data
-            return []
-    except Exception:
-        return []
-
-
-def _save_history_to_file(session_id: str, history: List[Dict[str, str]]) -> None:
-    """Сохраняет историю чата в файл."""
-    file_path = _get_history_file_path(session_id)
-    try:
-        with open(file_path, "w", encoding="utf-8") as f:
-            json.dump(history, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        # Если не удалось сохранить, логируем ошибку, но не прерываем работу
-        import logging
-        logging.error(f"Failed to save history to file: {e}")
-
-
-def _clear_history_file(session_id: str) -> None:
-    """Удаляет файл истории для данной сессии."""
-    file_path = _get_history_file_path(session_id)
-    try:
-        if os.path.exists(file_path):
-            os.remove(file_path)
-    except Exception:
-        pass
-
+def _start_new_session() -> str:
+    """Генерирует новый UUID чата и сохраняет его в cookie-сессии."""
+    import uuid
+    new_id = str(uuid.uuid4())
+    session[SESSION_ID_KEY] = new_id
+    session.modified = True
+    return new_id
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "change-me")
 
+@app.teardown_appcontext
+def close_db(exception: Optional[BaseException]) -> None:  # noqa: ARG001
+    """Closes DB connection at the end of request."""
+    db_close_db(exception)
+
+
+def _db_ensure_session(session_uuid: str, title: Optional[str] = None) -> None:
+    db_ensure_session(session_uuid, title)
+
+
+def _db_add_message(session_uuid: str, role: str, content: str, meta: Optional[dict]) -> None:
+    db_add_message(session_uuid, role, content, meta)
+
+
+def _db_clear_session(session_uuid: str) -> None:
+    db_clear_session(session_uuid)
+
+
+def _db_list_sessions(limit: int = 100) -> list[dict]:
+    return db_list_sessions(limit)
+
+
+def _db_get_messages(session_uuid: str) -> list[dict]:
+    return db_get_messages(session_uuid)
+
 
 # ---------------------------------------------------------------------------
-# Утилиты для загрузки и подготовки промптов
+# Утилиты для загрузки и подготовки промптов (переведены на хранение в SQLite)
 # ---------------------------------------------------------------------------
 
-
-def _load_json_mapping(file_path: str) -> OrderedDict[str, str]:
-    """Загружает JSON-файл и возвращает OrderedDict."""
-    if not os.path.exists(file_path):
-        return OrderedDict()
-    try:
-        with open(file_path, "r", encoding="utf-8") as file:
-            data = json.load(file)
-            if isinstance(data, dict):
-                return OrderedDict(data)
-    except Exception:
-        pass
-    return OrderedDict()
+def _db_load_presets() -> OrderedDict[str, Dict[str, str]]:
+    return db_load_presets()
 
 
-def load_raw_preset_files() -> Tuple[OrderedDict[str, str], OrderedDict[str, str]]:
-    """Загружает файлы с промптами и названиями предустановок."""
-    prompts = _load_json_mapping(PROMPTS_FILE_PATH)
-    names = _load_json_mapping(PROMPT_NAMES_FILE_PATH)
-
-    if not prompts:
-        prompts = OrderedDict(DEFAULT_PRESET_PROMPTS)
-    if not names:
-        names = OrderedDict(DEFAULT_PRESET_NAMES)
-
-    return prompts, names
+def _db_upsert_preset(key: str, name: str, prompt: str) -> None:
+    db_upsert_preset(key, name, prompt)
 
 
 def load_presets() -> OrderedDict[str, Dict[str, str]]:
-    """Загружает и объединяет предустановки из файлов."""
-    prompts, names = load_raw_preset_files()
-    presets = OrderedDict()
-
-    for key, title in names.items():
-        if key in prompts:
-            presets[key] = {"name": title, "prompt": prompts[key]}
-
-    for key, prompt in prompts.items():
-        if key not in presets:
-            presets[key] = {"name": key, "prompt": prompt}
-
+    """Загружает предустановки из БД, при отсутствии — заполняет значениями по умолчанию."""
+    presets = _db_load_presets()
     if not presets:
-        presets[DEFAULT_PRESET_KEY] = {
-            "name": DEFAULT_PRESET_NAMES[DEFAULT_PRESET_KEY],
-            "prompt": DEFAULT_PRESET_PROMPTS[DEFAULT_PRESET_KEY],
-        }
-
+        for key, prompt in DEFAULT_PRESET_PROMPTS.items():
+            name = DEFAULT_PRESET_NAMES.get(key, key)
+            _db_upsert_preset(key, name, prompt)
+        presets = _db_load_presets()
     return presets
 
 
 def write_presets(
     prompts: OrderedDict[str, str], names: OrderedDict[str, str]
 ) -> None:
-    """Сохраняет промпты и названия в файлы."""
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    with open(PROMPTS_FILE_PATH, "w", encoding="utf-8") as prompts_file:
-        json.dump(prompts, prompts_file, ensure_ascii=False, indent=2)
-    with open(PROMPT_NAMES_FILE_PATH, "w", encoding="utf-8") as names_file:
-        json.dump(names, names_file, ensure_ascii=False, indent=2)
+    """Сохраняет промпты и названия в БД."""
+    for key, prompt in prompts.items():
+        name = names.get(key, key)
+        _db_upsert_preset(key, name, prompt)
 
 
 def slugify(title: str) -> str:
-    """Преобразует строку в slug."""
-    slug = re.sub(r"[^a-zA-Z0-9]+", "-", title).strip("-").lower()
-    return slug or "preset"
+    """Преобразует строку в slug (через chat_utils)."""
+    return cu_slugify(title)
 
 
 def default_model_for(provider: str) -> str:
-    """Возвращает модель по умолчанию для провайдера."""
-    models = AVAILABLE_PROVIDERS[provider]["models"]
-    return next(iter(models))
+    """Возвращает модель по умолчанию для провайдера (через chat_utils)."""
+    return cu_default_model_for(AVAILABLE_PROVIDERS, provider)
 
 
-def default_chat_state(
-    presets: OrderedDict[str, Dict[str, str]]
-) -> Dict[str, object]:
-    """Создает начальное состояние чата."""
-    preset_key = (
-        DEFAULT_PRESET_KEY
-        if DEFAULT_PRESET_KEY in presets
-        else next(iter(presets))
+
+def default_chat_state(presets: OrderedDict[str, Dict[str, str]]) -> Dict[str, object]:
+    """Создает состояние чата по умолчанию (обертка над chat_utils.default_chat_state)."""
+    return cu_default_chat_state(
+        presets=presets,
+        available_providers=AVAILABLE_PROVIDERS,
+        default_preset_key=DEFAULT_PRESET_KEY,
+        default_provider=DEFAULT_PROVIDER,
+        default_temperature=DEFAULT_TEMPERATURE,
     )
-    provider_key = (
-        DEFAULT_PROVIDER
-        if DEFAULT_PROVIDER in AVAILABLE_PROVIDERS
-        else next(iter(AVAILABLE_PROVIDERS))
-    )
-    return {
-        "preset_key": preset_key,
-        "temperature": DEFAULT_TEMPERATURE,
-        "provider": provider_key,
-        "model": default_model_for(provider_key),
-        "history": [],
-    }
 
 
-def parse_temperature(raw_value: str | None, fallback: float) -> float:
-    """Парсит температуру из строки с валидацией."""
-    if raw_value is None:
-        return fallback
-    try:
-        temp = float(raw_value)
-    except ValueError:
-        return fallback
-    temp = max(0.0, min(2.0, round(temp, 2)))
-    return temp
 
 
 def estimate_tokens(text: str) -> int:
-    """Приблизительный подсчет токенов: ~1 токен = 4 символа."""
-    return max(1, len(text) // 4)
+    """Приблизительный подсчет токенов: ~1 токен = 4 символа (через chat_utils)."""
+    return cu_estimate_tokens(text)
 
 
 def estimate_request_tokens(
@@ -291,142 +257,25 @@ def estimate_request_tokens(
     history: List[Dict[str, str]],
     user_message: str,
 ) -> int:
-    """Подсчитывает общее количество токенов в запросе.
-    
-    Включает системный промпт, историю диалога и текущее сообщение пользователя.
-    """
-    total = estimate_tokens(system_prompt)
-    
-    for entry in history:
-        if not _validate_history_entry(entry):
-            continue
-        total += estimate_tokens(entry["content"])
-        # Добавляем небольшой штраф за роль (приблизительно 2 токена на сообщение)
-        total += 2
-    
-    total += estimate_tokens(user_message)
-    # Добавляем штраф за роль текущего сообщения пользователя
-    total += 2
-    
-    return total
+    """Подсчитывает общее количество токенов в запросе (через chat_utils)."""
+    return cu_estimate_request_tokens(system_prompt, history, user_message)
 
 
 def calculate_gigachat_cost(
     prompt_tokens: int, completion_tokens: int, model: str
 ) -> Optional[float]:
-    """Рассчитывает стоимость запроса к GigaChat в рублях.
-
-    Примерные цены (на 1000 токенов):
-    - GigaChat Lite: вход 0.01 руб, выход 0.03 руб
-    - GigaChat Pro: вход 0.05 руб, выход 0.15 руб
-    - GigaChat Pro Max: вход 0.10 руб, выход 0.30 руб
-    """
-    pricing = {
-        "GigaChat": {"input": 0.01, "output": 0.03},
-        "GigaChat-Pro": {"input": 0.05, "output": 0.15},
-        "GigaChat-Pro-Max": {"input": 0.10, "output": 0.30},
-    }
-
-    model_pricing = pricing.get(model, pricing["GigaChat"])
-    input_cost = (prompt_tokens / 1000.0) * model_pricing["input"]
-    output_cost = (completion_tokens / 1000.0) * model_pricing["output"]
-    return round(input_cost + output_cost, 6)
+    """Рассчитывает стоимость запроса к GigaChat в рублях (через chat_utils)."""
+    return cu_calculate_gigachat_cost(prompt_tokens, completion_tokens, model)
 
 
 def _validate_history_entry(entry: Dict[str, str]) -> bool:
-    """Проверяет валидность записи истории."""
-    return (
-        isinstance(entry, dict)
-        and "role" in entry
-        and "content" in entry
-    )
+    """Проверяет валидность записи истории (через chat_utils)."""
+    return cu_validate_history_entry(entry)
 
 
 def _extract_tokens_from_usage(usage: object) -> Tuple[Optional[int], ...]:
-    """Извлекает токены из объекта usage.
-
-    Returns:
-        Tuple[prompt_tokens, completion_tokens, total_tokens]
-    """
-    # Поддерживаем как объекты с атрибутами, так и словари
-    if isinstance(usage, dict):
-        prompt_tokens = usage.get("prompt_tokens") or usage.get("input_tokens")
-        completion_tokens = usage.get("completion_tokens") or usage.get("output_tokens")
-        total_tokens = usage.get("total_tokens") or usage.get("tokens")
-    else:
-        # Пробуем получить как атрибуты объекта
-        prompt_tokens = getattr(usage, "prompt_tokens", None) or getattr(
-            usage, "input_tokens", None
-        )
-        completion_tokens = getattr(usage, "completion_tokens", None) or getattr(
-            usage, "output_tokens", None
-        )
-        total_tokens = getattr(usage, "total_tokens", None) or getattr(
-            usage, "tokens", None
-        )
-        
-        # Если это объект с методом dict() или __dict__, пробуем получить через него
-        if total_tokens is None:
-            try:
-                # Пробуем метод dict() (для Pydantic моделей)
-                if hasattr(usage, "dict"):
-                    usage_dict = usage.dict()
-                    if isinstance(usage_dict, dict):
-                        total_tokens = (
-                            usage_dict.get("total_tokens")
-                            or usage_dict.get("tokens")
-                            or usage_dict.get("total")
-                        )
-                # Пробуем __dict__ атрибут
-                elif hasattr(usage, "__dict__"):
-                    usage_dict = usage.__dict__
-                    if isinstance(usage_dict, dict):
-                        total_tokens = (
-                            usage_dict.get("total_tokens")
-                            or usage_dict.get("tokens")
-                            or usage_dict.get("total")
-                        )
-                # Пробуем получить все атрибуты через dir()
-                else:
-                    attrs = [attr for attr in dir(usage) if not attr.startswith("_")]
-                    for attr in ["total_tokens", "tokens", "total"]:
-                        if attr in attrs:
-                            try:
-                                value = getattr(usage, attr)
-                                if value is not None:
-                                    total_tokens = value
-                                    break
-                            except Exception:
-                                pass
-            except Exception:
-                pass
-
-    # Если total_tokens не найден или равен 0, но есть prompt_tokens и completion_tokens, вычисляем
-    # Примечание: GigaChat может возвращать total_tokens, который учитывает кэширование,
-    # поэтому если total_tokens не найден, используем сумму prompt_tokens + completion_tokens
-    if (total_tokens is None or total_tokens == 0) and prompt_tokens is not None and completion_tokens is not None:
-        # Вычисляем total_tokens только если он не был найден или равен 0
-        # Это может быть не совсем точно из-за кэширования, но лучше чем ничего
-        calculated_total = prompt_tokens + completion_tokens
-        if total_tokens is None:
-            total_tokens = calculated_total
-        elif total_tokens == 0:
-            # Если total_tokens равен 0, но есть prompt_tokens и completion_tokens,
-            # используем вычисленное значение
-            total_tokens = calculated_total
-
-    # Приводим к int
-    try:
-        if prompt_tokens is not None:
-            prompt_tokens = int(prompt_tokens)
-        if completion_tokens is not None:
-            completion_tokens = int(completion_tokens)
-        if total_tokens is not None:
-            total_tokens = int(total_tokens)
-    except (TypeError, ValueError):
-        pass
-
-    return prompt_tokens, completion_tokens, total_tokens
+    """Извлекает токены из объекта usage (через chat_utils)."""
+    return cu_extract_tokens_from_usage(usage)
 
 
 def _create_meta_dict(
@@ -436,133 +285,23 @@ def _create_meta_dict(
     elapsed: float,
     cost: Optional[float] = None,
 ) -> Dict[str, Optional[int | float]]:
-    """Создает словарь метаданных для ответа."""
-    return {
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": total_tokens,
-        "elapsed": elapsed,
-        "cost": cost,
-    }
+    """Создает словарь метаданных для ответа (через chat_utils)."""
+    return cu_create_meta_dict(prompt_tokens, completion_tokens, total_tokens, elapsed, cost)
 
 
 def _handle_hf_http_error(http_err: requests.HTTPError) -> None:
-    """Обрабатывает HTTP ошибки от Hugging Face API."""
-    response = http_err.response
-    status = response.status_code if response else "?"
-    detail = response.text if response else str(http_err)
-
-    if status == 404:
-        raise RuntimeError(
-            "Модель недоступна через Hugging Face Inference API. "
-            "Проверьте, опубликована ли она для Inference и не приватна."
-        ) from http_err
-    if status == 429:
-        raise RuntimeError(
-            "Превышен лимит запросов к Hugging Face Inference API."
-        ) from http_err
-    raise RuntimeError(
-        f"Hugging Face вернул ошибку {status}: {detail}"
-    ) from http_err
+    """Обрабатывает HTTP ошибки от Hugging Face API (через chat_utils)."""
+    return cu_handle_hf_http_error(http_err)
 
 
 def _handle_hf_response_error(response: requests.Response) -> None:
-    """Обрабатывает ошибки ответа от Hugging Face API."""
-    if response.status_code == 404:
-        raise RuntimeError(
-            "Модель недоступна через Hugging Face Inference API. "
-            "Проверьте, опубликована ли она для Inference и не приватна."
-        )
-    if response.status_code == 429:
-        raise RuntimeError(
-            "Превышен лимит запросов к Hugging Face Inference API."
-        )
-    if response.status_code >= 400:
-        raise RuntimeError(
-            f"Hugging Face вернул ошибку {response.status_code}: "
-            f"{response.text}"
-        )
+    """Обрабатывает ошибки ответа от Hugging Face API (через chat_utils)."""
+    return cu_handle_hf_response_error(response)
 
 
 # ---------------------------------------------------------------------------
-# GigaChat interaction
+# GigaChat interaction moved to gigachat_client.ask_gigachat
 # ---------------------------------------------------------------------------
-
-
-def ask_gigachat(
-    system_prompt: str,
-    history: List[Dict[str, str]],
-    user_message: str,
-    temperature: float,
-    model: str | None = None,
-) -> Tuple[str, Dict[str, Optional[int | float]]]:
-    """Запрашивает ответ от GigaChat API.
-
-    Returns:
-        Tuple[текст ответа, метаданные]
-    """
-    credentials = os.getenv("GIGACHAT_CREDENTIALS")
-    if not credentials:
-        raise RuntimeError(
-            "Не найден GIGACHAT_CREDENTIALS. "
-            "Добавьте ключ авторизации в .env или переменные окружения."
-        )
-
-    if not model:
-        model = default_model_for("gigachat")
-
-    messages: List[Messages] = [
-        Messages(role=MessagesRole.SYSTEM, content=system_prompt),
-    ]
-
-    for entry in history:
-        if not _validate_history_entry(entry):
-            continue
-        role = (
-            MessagesRole.USER
-            if entry["role"] == "user"
-            else MessagesRole.ASSISTANT
-        )
-        messages.append(Messages(role=role, content=entry["content"]))
-
-    messages.append(Messages(role=MessagesRole.USER, content=user_message))
-
-    chat = Chat(
-        messages=messages,
-        model=model,
-        temperature=temperature,
-        flags=["no_cache"],
-    )
-
-    with GigaChat(credentials=credentials, verify_ssl_certs=False) as client:
-        start = time.perf_counter()
-        response = client.chat(chat)
-        elapsed = time.perf_counter() - start
-
-    usage = getattr(response, "usage", None)
-    prompt_tokens = None
-    completion_tokens = None
-    total_tokens = None
-
-    if usage is not None:
-        prompt_tokens, completion_tokens, total_tokens = (
-            _extract_tokens_from_usage(usage)
-        )
-        
-        # Отладочная информация (можно удалить после проверки)
-        # print(f"DEBUG: usage type: {type(usage)}")
-        # print(f"DEBUG: usage dir: {dir(usage) if hasattr(usage, '__dict__') else 'N/A'}")
-        # print(f"DEBUG: Extracted - prompt: {prompt_tokens}, completion: {completion_tokens}, total: {total_tokens}")
-
-    cost = None
-    if prompt_tokens is not None and completion_tokens is not None:
-        cost = calculate_gigachat_cost(prompt_tokens, completion_tokens, model)
-
-    meta = _create_meta_dict(
-        prompt_tokens, completion_tokens, total_tokens, elapsed, cost
-    )
-
-    return response.choices[0].message.content, meta
 
 
 def ask_huggingface(
@@ -779,18 +518,10 @@ def _create_chat_state(
 
 
 def _save_session_state(state: Dict[str, object]) -> None:
-    """Сохраняет состояние в сессию и историю в файл."""
-    # Получаем ID сессии
-    session_id = _get_session_id()
+    """Сохраняет состояние (только настройки) в cookie-сессию.
     
-    # Извлекаем историю из состояния
-    history = state.get("history", [])
-    
-    # Сохраняем историю в файл
-    _save_history_to_file(session_id, history)
-    
-    # Сохраняем в сессию только настройки (без истории)
-    # Это значительно уменьшает размер cookie
+    История сообщений хранится в БД и из cookie не пишется.
+    """
     session_state = {
         "preset_key": state.get("preset_key"),
         "temperature": state.get("temperature"),
@@ -810,14 +541,14 @@ def _save_session_state(state: Dict[str, object]) -> None:
 
 
 def _load_session_state() -> Dict[str, object]:
-    """Загружает состояние из сессии и историю из файла."""
+    """Загружает состояние из cookie-сессии и историю из БД."""
     session_id = _get_session_id()
     
     # Загружаем настройки из сессии
     session_state = session.get(SESSION_KEY, {})
     
-    # Загружаем историю из файла
-    history = _load_history_from_file(session_id)
+    # Загружаем историю из БД
+    history = _db_get_messages(session_id)
     
     # Объединяем настройки и историю
     # Если настроек нет в сессии, возвращаем только историю (настройки будут установлены через _validate_chat_state)
@@ -904,18 +635,12 @@ def _handle_save_preset(
         flash("Введите текст промпта для сохранения.", "warning")
         return False, None
 
-    raw_prompts, raw_names = load_raw_preset_files()
+    # Генерируем уникальный ключ (slug) относительно существующих ключей в БД
     base_slug = slugify(preset_title)
-    slug = base_slug
-    counter = 2
+    slug = make_unique_preset_key(base_slug)
 
-    while slug in raw_prompts or slug in raw_names:
-        slug = f"{base_slug}-{counter}"
-        counter += 1
-
-    raw_prompts[slug] = preset_prompt_text
-    raw_names[slug] = preset_title
-    write_presets(raw_prompts, raw_names)
+    # Сохраняем новую предустановку в БД
+    _db_upsert_preset(slug, preset_title, preset_prompt_text)
 
     flash("Предустановка сохранена.", "info")
     new_state = _create_chat_state(slug, temperature, provider, model)
@@ -974,15 +699,11 @@ def index():
             return redirect(url_for("index"))
 
         if action == "reset":
-            # Очищаем файл истории
-            session_id = _get_session_id()
-            _clear_history_file(session_id)
-            
-            state = _create_chat_state(
-                preset_key, temperature, provider, model
-            )
+            # Начинаем новый диалог (не удаляя историю предыдущего)
+            _start_new_session()
+            state = _create_chat_state(preset_key, temperature, provider, model)
             _save_session_state(state)
-            flash("Диалог сброшен.", "info")
+            flash("Начат новый диалог.", "info")
             return redirect(url_for("index"))
 
         message = request.form.get("message", "").strip()
@@ -1072,6 +793,21 @@ def index():
             }
         )
 
+        # Сохраняем в БД: создаем сессию (заголовок = первое пользовательское сообщение)
+        session_id = _get_session_id()
+        first_user_title = None
+        # Если в БД еще нет сессии — заголовок берем по первому USER сообщению истории
+        # В качестве простого правила возьмем первые 64 символа
+        for entry in state["history"]:
+            if entry.get("role") == "user":
+                first_user_title = (entry.get("content") or "").strip()
+                break
+        title_trimmed = (first_user_title or "").replace("\n", " ")[:64]
+        _db_ensure_session(session_id, title=title_trimmed if title_trimmed else None)
+        # Добавляем два новых сообщения
+        _db_add_message(session_id, "user", message, user_meta)
+        _db_add_message(session_id, "assistant", assistant_text, assistant_meta)
+
         _save_session_state(state)
         return redirect(url_for("index"))
 
@@ -1082,6 +818,31 @@ def index():
         providers=AVAILABLE_PROVIDERS,
         state=state,
         history=state["history"],
+        models=AVAILABLE_PROVIDERS[state["provider"]]["models"],
+    )
+
+
+@app.route("/history", methods=["GET"])
+def history_list():
+    """Список сохраненных сессий из БД."""
+    sessions = _db_list_sessions(limit=200)
+    return render_template("history.html", sessions=sessions)
+
+
+@app.route("/history/<session_uuid>", methods=["GET"])
+def history_view(session_uuid: str):
+    """Просмотр конкретной истории диалога."""
+    messages = _db_get_messages(session_uuid)
+    # Для удобства отображения используем тот же шаблон чата, но в read-only режиме
+    presets = load_presets()
+    state = default_chat_state(presets)
+    state["history"] = messages
+    return render_template(
+        "index.html",
+        presets=presets,
+        providers=AVAILABLE_PROVIDERS,
+        state=state,
+        history=messages,
         models=AVAILABLE_PROVIDERS[state["provider"]]["models"],
     )
 

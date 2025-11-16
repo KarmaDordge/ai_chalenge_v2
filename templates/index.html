@@ -16,6 +16,9 @@
         <h1 class="title">Помощник на все руки</h1>
         <p class="subtitle">Веб-версия помощника на базе GigaChat</p>
       </div>
+      <nav>
+        <a href="{{ url_for('history_list') }}" class="btn tiny">История</a>
+      </nav>
     </header>
 
     {% with messages = get_flashed_messages(with_categories=true) %}
@@ -95,7 +98,7 @@
           {% endif %}
         </div>
 
-        <form method="post" class="composer-bar rounded-card" id="composer-form">
+        <form method="post" action="{{ url_for('index') }}" class="composer-bar rounded-card" id="composer-form">
           <input type="hidden" name="preset" id="composer-preset" value="{{ state.preset_key }}">
           <input type="hidden" name="provider" id="composer-provider" value="{{ state.provider }}">
           <input type="hidden" name="model" id="composer-model" value="{{ state.model }}">
@@ -121,7 +124,7 @@
       </section>
 
       <section class="controls rounded-card">
-        <form method="post" class="controls-form">
+        <form method="post" action="{{ url_for('index') }}" class="controls-form">
           <div class="field-grid">
             <div class="field">
               <label for="provider">Провайдер</label>
@@ -196,7 +199,7 @@
         <h3>Сохранить предустановку</h3>
         <button type="button" class="modal-close" id="close-preset-modal">×</button>
       </div>
-      <form method="post" class="modal-form" id="preset-modal-form">
+      <form method="post" action="{{ url_for('index') }}" class="modal-form" id="preset-modal-form">
         <input type="hidden" name="preset" id="modal-preset" value="{{ state.preset_key }}">
         <input type="hidden" name="provider" id="modal-provider" value="{{ state.provider }}">
         <input type="hidden" name="model" id="modal-model" value="{{ state.model }}">
