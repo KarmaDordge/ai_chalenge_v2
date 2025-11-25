@@ -28,6 +28,14 @@ from weather_tool import (
     get_weather,
 )
 
+# Импорт vector store для RAG
+try:
+    from vector_store import embed_query, search_chunks
+    VECTOR_STORE_AVAILABLE = True
+except ImportError:
+    VECTOR_STORE_AVAILABLE = False
+    logger.warning("vector_store не доступен, RAG будет отключен")
+
 
 def _extract_city_name(text: str) -> str | None:
     """
@@ -158,6 +166,80 @@ def _extract_coordinates(text: str) -> tuple[float | None, float | None]:
     return None, None
 
 
+def build_messages_with_context(
+    question: str,
+    chunks: List[Dict[str, Any]],
+    system_prompt: str = "",
+    history: List[Dict[str, str]] | None = None,
+) -> List[Messages]:
+    """
+    Собирает messages для GigaChat с контекстом из найденных чанков.
+    
+    Args:
+        question: Вопрос пользователя
+        chunks: Список найденных релевантных чанков
+        system_prompt: Исходный системный промпт
+        history: История сообщений
+        
+    Returns:
+        Список сообщений для GigaChat API
+    """
+    # Ограничиваем длину контекста (максимум ~4000 символов)
+    max_context_length = 4000
+    context_parts = []
+    current_length = 0
+    
+    for chunk in chunks:
+        chunk_text = chunk.get("text", "")
+        chunk_path = chunk.get("path", "")
+        chunk_headings = chunk.get("headings", "")
+        
+        # Формируем строку чанка с метаданными
+        chunk_str = ""
+        if chunk_path:
+            chunk_str += f"[Источник: {chunk_path}]"
+        if chunk_headings:
+            chunk_str += f" {chunk_headings}\n"
+        chunk_str += f"{chunk_text}\n\n"
+        
+        if current_length + len(chunk_str) > max_context_length:
+            break
+        
+        context_parts.append(chunk_str)
+        current_length += len(chunk_str)
+    
+    # Склеиваем контекст
+    context_text = "\n".join(context_parts).strip()
+    
+    # Формируем расширенный системный промпт
+    enhanced_system_prompt = (
+        f"{system_prompt}\n\n"
+        "Отвечай только на основе предоставленного контекста. "
+        "Если в контексте нет информации для ответа, скажи об этом честно. "
+        "Используй информацию из контекста максимально точно.\n\n"
+        "Контекст:\n"
+        f"{context_text}"
+    )
+    
+    # Собираем messages
+    messages: List[Messages] = [
+        Messages(role=MessagesRole.SYSTEM, content=enhanced_system_prompt),
+    ]
+    
+    # Добавляем историю
+    if history:
+        for entry in history:
+            if not cu_validate_history_entry(entry):
+                continue
+            role = MessagesRole.USER if entry["role"] == "user" else MessagesRole.ASSISTANT
+            messages.append(Messages(role=role, content=entry["content"]))
+    
+    # Добавляем текущий вопрос
+    messages.append(Messages(role=MessagesRole.USER, content=question))
+    
+    return messages
+
+
 def _execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
     """
     Выполняет вызов tool на основе данных из tool_call.
@@ -192,11 +274,13 @@ def ask_gigachat(
     temperature: float,
     model: str | None = None,
     enable_tools: bool = True,
+    use_local_vectors: bool = False,
 ) -> Tuple[str, Dict[str, Optional[int | float]]]:
     """
     Взаимодействие с GigaChat API: формирование сообщений, запрос, метаданные.
     
     Поддерживает автоматическую обработку tool calls (например, weather tool).
+    Поддерживает RAG через локальную векторную базу данных.
     
     Args:
         system_prompt: Системный промпт
@@ -205,6 +289,7 @@ def ask_gigachat(
         temperature: Температура генерации
         model: Модель GigaChat (по умолчанию "GigaChat")
         enable_tools: Включить ли поддержку tools (по умолчанию True)
+        use_local_vectors: Использовать ли локальную векторную базу для RAG (по умолчанию False)
         
     Returns:
         Tuple[текст ответа, метаданные]
@@ -220,6 +305,23 @@ def ask_gigachat(
         # Избегаем зависимости от AVAILABLE_PROVIDERS; берем безопасное значение по умолчанию
         model = "GigaChat"
 
+    # Обработка RAG: поиск релевантных чанков, если включен флаг
+    context_chunks = []
+    if use_local_vectors:
+        if not VECTOR_STORE_AVAILABLE:
+            logger.warning("RAG запрошен, но vector_store недоступен. Продолжаем без RAG.")
+        else:
+            try:
+                logger.info("Поиск релевантных чанков для RAG...")
+                # Получаем эмбеддинг запроса
+                query_embedding = embed_query(user_message)
+                # Ищем релевантные чанки
+                context_chunks = search_chunks(query_embedding)
+                logger.info(f"Найдено {len(context_chunks)} релевантных чанков")
+            except Exception as e:
+                logger.error(f"Ошибка при поиске чанков для RAG: {e}")
+                # Продолжаем без RAG в случае ошибки
+
     # Регистрируем tools, если включены
     tools = None
     if enable_tools:
@@ -227,24 +329,45 @@ def ask_gigachat(
         logger.info(f"Зарегистрированы tools: {len(tools)} tool(s)")
         logger.debug(f"Tools definition: {json.dumps(tools, ensure_ascii=False, indent=2)}")
 
-    # Добавляем информацию о доступных tools в системный промпт, если tools включены
-    enhanced_system_prompt = system_prompt
-    if enable_tools and tools:
-        tools_info = "\n\nДоступные инструменты:\n"
-        for tool in tools:
-            tool_func = tool.get("function", {})
-            tools_info += f"- {tool_func.get('name', 'unknown')}: {tool_func.get('description', '')}\n"
-        enhanced_system_prompt = system_prompt + tools_info
-    
-    messages: List[Messages] = [
-        Messages(role=MessagesRole.SYSTEM, content=enhanced_system_prompt),
-    ]
+    # Формируем messages: если включен RAG, используем build_messages_with_context
+    if use_local_vectors and context_chunks:
+        # Добавляем информацию о доступных tools в системный промпт, если tools включены
+        enhanced_system_prompt = system_prompt
+        if enable_tools and tools:
+            tools_info = "\n\nДоступные инструменты:\n"
+            for tool in tools:
+                tool_func = tool.get("function", {})
+                tools_info += f"- {tool_func.get('name', 'unknown')}: {tool_func.get('description', '')}\n"
+            enhanced_system_prompt = system_prompt + tools_info
+        
+        messages = build_messages_with_context(
+            question=user_message,
+            chunks=context_chunks,
+            system_prompt=enhanced_system_prompt,
+            history=history,
+        )
+    else:
+        # Обычный режим без RAG
+        # Добавляем информацию о доступных tools в системный промпт, если tools включены
+        enhanced_system_prompt = system_prompt
+        if enable_tools and tools:
+            tools_info = "\n\nДоступные инструменты:\n"
+            for tool in tools:
+                tool_func = tool.get("function", {})
+                tools_info += f"- {tool_func.get('name', 'unknown')}: {tool_func.get('description', '')}\n"
+            enhanced_system_prompt = system_prompt + tools_info
+        
+        messages: List[Messages] = [
+            Messages(role=MessagesRole.SYSTEM, content=enhanced_system_prompt),
+        ]
 
-    for entry in history:
-        if not cu_validate_history_entry(entry):
-            continue
-        role = MessagesRole.USER if entry["role"] == "user" else MessagesRole.ASSISTANT
-        messages.append(Messages(role=role, content=entry["content"]))
+        for entry in history:
+            if not cu_validate_history_entry(entry):
+                continue
+            role = MessagesRole.USER if entry["role"] == "user" else MessagesRole.ASSISTANT
+            messages.append(Messages(role=role, content=entry["content"]))
+
+        messages.append(Messages(role=MessagesRole.USER, content=user_message))
 
     # Проверяем, не упоминает ли пользователь погоду
     # Если да, пытаемся определить координаты (из текста или по названию города через LLM)
@@ -275,8 +398,6 @@ def ask_gigachat(
                 weather_data = get_weather(latitude, longitude)
                 logger.info(f"Результат weather tool: {json.dumps(weather_data, ensure_ascii=False)}")
                 # Не добавляем данные в промпт, чтобы GigaChat не генерировал лишние объяснения
-
-    messages.append(Messages(role=MessagesRole.USER, content=user_message))
 
     # Начало измерения времени
     start = time.perf_counter()
@@ -487,6 +608,19 @@ def ask_gigachat(
             meta = cu_create_meta_dict(
                 prompt_tokens, completion_tokens, total_tokens, elapsed, cost
             )
+            
+            # Добавляем информацию об источниках, если использовался RAG
+            if use_local_vectors and context_chunks:
+                # Берем первые 3 чанка с наименьшим score (наиболее релевантные)
+                sources = []
+                for chunk in sorted(context_chunks, key=lambda x: x.get("score", float("inf")))[:3]:
+                    source_info = {
+                        "path": chunk.get("path", ""),
+                        "headings": chunk.get("headings", ""),
+                        "score": chunk.get("score", 0.0),
+                    }
+                    sources.append(source_info)
+                meta["sources"] = sources
 
             return message.content or "", meta
         

@@ -6,6 +6,7 @@
 
 - **Веб-чат**: удобный интерфейс чата с современным UI (`templates/index.html`, `static/styles.css`).
 - **Два провайдера**: переключение между GigaChat и моделями Hugging Face.
+- **RAG (Retrieval-Augmented Generation)**: поддержка локальной векторной базы данных PostgreSQL с pgvector для контекстного поиска релевантных чанков.
 - **История сессий**: сохранение диалогов в SQLite (`chat_history/chat_history.db`) и просмотр истории через отдельную страницу.
 - **Предустановки промптов**: хранение системных промптов (presets) в базе данных, создание новых через UI.
 - **Метаданные запросов**: отображение токенов, времени ответа и примерной стоимости запросов GigaChat.
@@ -20,7 +21,11 @@
 - Установленные зависимости из `requirements.txt`
 - Зарегистрированные ключи:
   - **GigaChat**: переменная окружения `GIGACHAT_CREDENTIALS`
-  - **Hugging Face**: переменная окружения `HUGGINGFACE_API_TOKEN`
+  - **Hugging Face**: переменная окружения `HUGGINGFACE_API_TOKEN` (опционально)
+- **Для RAG (опционально)**:
+  - PostgreSQL с расширением pgvector
+  - Таблица `public.chunk_embeddings` с колонкой `embedding VECTOR(dim)`
+  - Ollama для создания эмбеддингов (модель `nomic-embed-text`)
 
 ### Установка и запуск
 
@@ -29,11 +34,39 @@ cd /Users/aizen/gigachat_api
 python -m venv venv
 source venv/bin/activate  # в Windows: venv\Scripts\activate
 pip install -r requirements.txt
+```
 
-export FLASK_SECRET_KEY="change-me"            # или другой секретный ключ
-export GIGACHAT_CREDENTIALS="..."             # токен GigaChat
-export HUGGINGFACE_API_TOKEN="..."            # токен Hugging Face
+### Настройка переменных окружения
 
+Создайте файл `.env` в корне проекта (или скопируйте из `.env.example`, если есть) и добавьте:
+
+```env
+# Обязательные
+FLASK_SECRET_KEY=change-me
+GIGACHAT_CREDENTIALS=your_credentials_here
+
+# Опциональные
+HUGGINGFACE_API_TOKEN=your_hf_token_here
+
+# Для RAG (опционально)
+DATABASE_URL=postgresql://user:pass@host:port/db
+PGVECTOR_METRIC=cosine
+TOP_K=8
+OLLAMA_URL=http://localhost:11434
+OLLAMA_EMBED_MODEL=nomic-embed-text
+```
+
+**Альтернатива**: можно установить переменные через `export` в терминале перед запуском:
+
+```bash
+export GIGACHAT_CREDENTIALS="..."
+export DATABASE_URL="postgresql://user:pass@host:port/db"
+# и т.д.
+```
+
+### Запуск
+
+```bash
 python chatbot_gui.py
 ```
 
@@ -76,6 +109,14 @@ python chatbot_gui.py
   Обёртка над SDK GigaChat:
   - `ask_gigachat()` формирует список сообщений (`system + history + user`),
     отправляет запрос через `GigaChat`, извлекает usage и считает стоимость.
+  - Поддержка RAG: при `use_local_vectors=True` ищет релевантные чанки через `vector_store`
+    и формирует контекст через `build_messages_with_context()`.
+
+- **`vector_store.py`**  
+  Модуль для работы с векторной базой данных PostgreSQL (pgvector):
+  - `init_pg()` — создание соединения с БД;
+  - `embed_query()` — создание эмбеддинга запроса через Ollama API;
+  - `search_chunks()` — поиск top-k релевантных чанков по cosine similarity.
 
 - **`templates/index.html`**  
   Основной шаблон чата:
@@ -123,7 +164,13 @@ python chatbot_gui.py
    - `estimate_tokens(message)` — для текущего сообщения;
    - `estimate_request_tokens(system_prompt, history, message)` — для всего запроса.
 4. Выбор провайдера:
-   - если `provider == "gigachat"` → вызывается `ask_gigachat()` из `gigachat_client.py`;
+   - если `provider == "gigachat"` → вызывается `ask_gigachat()` из `gigachat_client.py`:
+     - если включен флаг `use_local_vectors` (через checkbox в UI):
+       - создаётся эмбеддинг запроса через `embed_query()` (Ollama);
+       - выполняется поиск релевантных чанков через `search_chunks()` (PostgreSQL/pgvector);
+       - формируется контекст через `build_messages_with_context()` с найденными чанками;
+       - в метаданные ответа добавляется информация об источниках (первые 3 чанка);
+     - иначе — обычный режим без RAG;
    - иначе — `ask_huggingface()` в `chatbot_gui.py`, который:
      - при `mode="chat-completion"` обращается к `InferenceClient.chat.completions.create`;
      - при `mode="text-generation"` — к REST‑endpoint Hugging Face (`requests.post`).
@@ -174,6 +221,12 @@ python chatbot_gui.py
 - **Добавить нового провайдера модели**:
   - расширить словарь `AVAILABLE_PROVIDERS` в `chatbot_gui.py` (название, модели, режимы `task`/`mode`);
   - добавить новую ветку обработки в `index()` (по аналогии с GigaChat/Hugging Face).
+
+- **Настроить RAG**:
+  - убедиться, что PostgreSQL с pgvector настроен и таблица `public.chunk_embeddings` существует;
+  - настроить переменные окружения: `DATABASE_URL`, `PGVECTOR_METRIC`, `TOP_K`, `OLLAMA_URL`, `OLLAMA_EMBED_MODEL`;
+  - включить checkbox "Использовать локальную базу векторов (RAG)" в UI;
+  - при включенном флаге ответы будут содержать контекст из найденных чанков и список источников.
 
 - **Изменить UI**:
   - править разметку в `templates/index.html` и стили в `static/styles.css`.

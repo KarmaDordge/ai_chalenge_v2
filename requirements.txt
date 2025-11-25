@@ -13,3 +13,6 @@ Flask>=3.0.0
 # Для работы с Hugging Face
 huggingface_hub>=0.20.0
 
+# Для работы с PostgreSQL и pgvector
+psycopg2-binary>=2.9.0
+

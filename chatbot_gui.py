@@ -236,13 +236,16 @@ def default_model_for(provider: str) -> str:
 
 def default_chat_state(presets: OrderedDict[str, Dict[str, str]]) -> Dict[str, object]:
     """Создает состояние чата по умолчанию (обертка над chat_utils.default_chat_state)."""
-    return cu_default_chat_state(
+    state = cu_default_chat_state(
         presets=presets,
         available_providers=AVAILABLE_PROVIDERS,
         default_preset_key=DEFAULT_PRESET_KEY,
         default_provider=DEFAULT_PROVIDER,
         default_temperature=DEFAULT_TEMPERATURE,
     )
+    # Добавляем use_local_vectors по умолчанию
+    state["use_local_vectors"] = False
+    return state
 
 
 
@@ -506,6 +509,7 @@ def _create_chat_state(
     provider: str,
     model: str,
     history: List[Dict[str, str]] | None = None,
+    use_local_vectors: bool = False,
 ) -> Dict[str, object]:
     """Создает словарь состояния чата."""
     return {
@@ -514,6 +518,7 @@ def _create_chat_state(
         "provider": provider,
         "model": model,
         "history": history or [],
+        "use_local_vectors": use_local_vectors,
     }
 
 
@@ -527,6 +532,7 @@ def _save_session_state(state: Dict[str, object]) -> None:
         "temperature": state.get("temperature"),
         "provider": state.get("provider"),
         "model": state.get("model"),
+        "use_local_vectors": state.get("use_local_vectors", False),
     }
     
     try:
@@ -560,6 +566,7 @@ def _load_session_state() -> Dict[str, object]:
         "temperature": session_state.get("temperature"),
         "provider": session_state.get("provider"),
         "model": session_state.get("model"),
+        "use_local_vectors": session_state.get("use_local_vectors", False),
         "history": history,
     }
     
@@ -588,7 +595,7 @@ def _validate_chat_state(
 
 def _parse_form_settings(
     state: Dict[str, object], presets: OrderedDict[str, Dict[str, str]]
-) -> Tuple[str, float, str, str]:
+) -> Tuple[str, float, str, str, bool]:
     """Парсит настройки из формы запроса."""
     preset_key = request.form.get("preset") or state["preset_key"]
     if preset_key not in presets:
@@ -610,7 +617,10 @@ def _parse_form_settings(
     if model not in provider_models:
         model = default_model_for(provider)
 
-    return preset_key, temperature, provider, model
+    # Парсим флаг использования локальных векторов
+    use_local_vectors = request.form.get("use_local_vectors") == "on"
+
+    return preset_key, temperature, provider, model, use_local_vectors
 
 
 def _handle_save_preset(
@@ -674,7 +684,7 @@ def index():
 
     if request.method == "POST":
         action = request.form.get("action", "send")
-        preset_key, temperature, provider, model = _parse_form_settings(
+        preset_key, temperature, provider, model, use_local_vectors = _parse_form_settings(
             state, presets
         )
 
@@ -693,6 +703,7 @@ def index():
                     "temperature": temperature,
                     "provider": provider,
                     "model": model,
+                    "use_local_vectors": use_local_vectors,
                 }
             )
             _save_session_state(state)
@@ -701,7 +712,7 @@ def index():
         if action == "reset":
             # Начинаем новый диалог (не удаляя историю предыдущего)
             _start_new_session()
-            state = _create_chat_state(preset_key, temperature, provider, model)
+            state = _create_chat_state(preset_key, temperature, provider, model, use_local_vectors=use_local_vectors)
             _save_session_state(state)
             flash("Начат новый диалог.", "info")
             return redirect(url_for("index"))
@@ -715,6 +726,7 @@ def index():
                     "temperature": temperature,
                     "provider": provider,
                     "model": model,
+                    "use_local_vectors": use_local_vectors,
                 }
             )
             _save_session_state(state)
@@ -722,11 +734,11 @@ def index():
 
         settings_changed = _check_settings_changed(
             state, preset_key, provider, temperature, model
-        )
+        ) or state.get("use_local_vectors", False) != use_local_vectors
 
         if settings_changed:
             state = _create_chat_state(
-                preset_key, temperature, provider, model
+                preset_key, temperature, provider, model, use_local_vectors=use_local_vectors
             )
         else:
             state.update(
@@ -735,6 +747,7 @@ def index():
                     "temperature": temperature,
                     "provider": provider,
                     "model": model,
+                    "use_local_vectors": use_local_vectors,
                 }
             )
 
@@ -752,6 +765,7 @@ def index():
                     user_message=message,
                     temperature=temperature,
                     model=model,
+                    use_local_vectors=use_local_vectors,
                 )
             else:
                 model_meta = AVAILABLE_PROVIDERS[provider]["models"].get(

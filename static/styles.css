@@ -579,6 +579,62 @@ body {
   text-decoration: underline;
 }
 
+/* Checkbox styles */
+.checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 14px;
+  color: #334155;
+}
+
+.checkbox-label input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  cursor: pointer;
+  accent-color: #2563eb;
+}
+
+.checkbox-label span {
+  user-select: none;
+}
+
+/* Sources styles */
+.meta-sources {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(148, 163, 184, 0.2);
+}
+
+.sources-list {
+  margin: 4px 0 0 0;
+  padding-left: 20px;
+  list-style: none;
+}
+
+.sources-list li {
+  margin: 4px 0;
+  font-size: 12px;
+  color: #64748b;
+  line-height: 1.5;
+}
+
+.source-path {
+  font-weight: 500;
+  color: #2563eb;
+}
+
+.source-headings {
+  color: #475569;
+  font-style: italic;
+}
+
+.source-score {
+  color: #94a3b8;
+  font-size: 11px;
+}
+
 @media (max-width: 960px) {
   .content {
     grid-template-columns: 1fr;

@@ -68,6 +68,26 @@
                             <span class="meta-cost">💰 {{ item.meta.cost | round(6) }} ₽</span>
                           {% endif %}
                         </div>
+                        {% if item.meta.sources %}
+                          <div class="meta-row meta-sources">
+                            <span class="meta-label">📚 Источники:</span>
+                            <ul class="sources-list">
+                              {% for source in item.meta.sources %}
+                                <li>
+                                  {% if source.path %}
+                                    <span class="source-path">{{ source.path }}</span>
+                                  {% endif %}
+                                  {% if source.headings %}
+                                    <span class="source-headings">{{ source.headings }}</span>
+                                  {% endif %}
+                                  {% if source.score is defined %}
+                                    <span class="source-score">(score: {{ source.score | float | round(4) }})</span>
+                                  {% endif %}
+                                </li>
+                              {% endfor %}
+                            </ul>
+                          </div>
+                        {% endif %}
                       </div>
                     {% endif %}
                   </div>
@@ -103,6 +123,7 @@
           <input type="hidden" name="provider" id="composer-provider" value="{{ state.provider }}">
           <input type="hidden" name="model" id="composer-model" value="{{ state.model }}">
           <input type="hidden" name="temperature" id="composer-temperature" value="{{ '%.2f'|format(state.temperature) }}">
+          <input type="hidden" name="use_local_vectors" id="composer-use-local-vectors" value="{% if state.get('use_local_vectors') %}on{% endif %}">
 
           <div class="composer-input-wrapper">
             <textarea
@@ -172,6 +193,18 @@
                 value="{{ '%.2f'|format(state.temperature) }}"
               >
             </div>
+
+            <div class="field">
+              <label class="checkbox-label">
+                <input
+                  id="use_local_vectors"
+                  name="use_local_vectors"
+                  type="checkbox"
+                  {% if state.get('use_local_vectors') %}checked{% endif %}
+                >
+                <span>Использовать локальную базу векторов (RAG)</span>
+              </label>
+            </div>
           </div>
 
           <section class="prompt-preview">
@@ -204,6 +237,7 @@
         <input type="hidden" name="provider" id="modal-provider" value="{{ state.provider }}">
         <input type="hidden" name="model" id="modal-model" value="{{ state.model }}">
         <input type="hidden" name="temperature" id="modal-temperature" value="{{ '%.2f'|format(state.temperature) }}">
+        <input type="hidden" name="use_local_vectors" id="modal-use-local-vectors" value="{% if state.get('use_local_vectors') %}on{% endif %}">
 
         <div class="field">
           <label for="modal_preset_title">Название</label>
@@ -271,6 +305,8 @@
     const composerProvider = document.getElementById('composer-provider');
     const composerModel = document.getElementById('composer-model');
     const composerTemperature = document.getElementById('composer-temperature');
+    const composerUseLocalVectors = document.getElementById('composer-use-local-vectors');
+    const useLocalVectorsCheckbox = document.getElementById('use_local_vectors');
     const composerInput = document.getElementById('composer-message');
     const composerTokens = document.getElementById('composer-tokens');
     const tokensCountSpan = composerTokens ? composerTokens.querySelector('.tokens-count') : null;
@@ -352,11 +388,18 @@
       if (composerProvider) composerProvider.value = providerSelect.value;
       if (composerModel) composerModel.value = modelSelect.value;
       if (composerTemperature) composerTemperature.value = temperatureInput.value;
+      if (composerUseLocalVectors && useLocalVectorsCheckbox) {
+        composerUseLocalVectors.value = useLocalVectorsCheckbox.checked ? 'on' : '';
+      }
 
       if (modalPresetInput) modalPresetInput.value = presetSelect.value;
       if (modalProviderInput) modalProviderInput.value = providerSelect.value;
       if (modalModelInput) modalModelInput.value = modelSelect.value;
       if (modalTemperatureInput) modalTemperatureInput.value = temperatureInput.value;
+      const modalUseLocalVectors = document.getElementById('modal-use-local-vectors');
+      if (modalUseLocalVectors && useLocalVectorsCheckbox) {
+        modalUseLocalVectors.value = useLocalVectorsCheckbox.checked ? 'on' : '';
+      }
     }
 
     function syncAll() {
@@ -370,6 +413,7 @@
     if (presetSelect) presetSelect.addEventListener('change', syncAll);
     if (modelSelect) modelSelect.addEventListener('change', syncAll);
     if (temperatureInput) temperatureInput.addEventListener('input', syncAll);
+    if (useLocalVectorsCheckbox) useLocalVectorsCheckbox.addEventListener('change', syncAll);
     if (composerForm) composerForm.addEventListener('submit', syncHiddenFields);
 
     function openPresetModal() {
