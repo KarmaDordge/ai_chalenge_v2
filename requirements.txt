@@ -16,3 +16,6 @@ huggingface_hub>=0.20.0
 # Для работы с PostgreSQL и pgvector
 psycopg2-binary>=2.9.0
 
+# Для рендеринга Markdown
+markdown>=3.5.0
+

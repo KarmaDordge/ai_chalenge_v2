@@ -16,6 +16,7 @@ from typing import Dict, List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
+import markdown
 from flask import (
     Flask,
     g,
@@ -165,6 +166,76 @@ def _start_new_session() -> str:
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "change-me")
 
+
+# Фильтр для форматирования текста с поддержкой Markdown
+@app.template_filter('format_markdown')
+def format_markdown(text: str) -> str:
+    """
+    Форматирует текст с поддержкой Markdown и базовой обработкой LaTeX формул.
+    """
+    if not text:
+        return ""
+    
+    import re
+    from markupsafe import Markup
+    
+    # Временно заменяем формулы на плейсхолдеры перед обработкой Markdown
+    formula_placeholders = {}
+    placeholder_counter = 0
+    
+    # Блоковые формулы $$...$$
+    def replace_block_formula(match):
+        nonlocal placeholder_counter
+        placeholder = f"__FORMULA_BLOCK_{placeholder_counter}__"
+        formula_placeholders[placeholder] = f'<div class="math-block">{match.group(1).strip()}</div>'
+        placeholder_counter += 1
+        return placeholder
+    
+    text = re.sub(
+        r'\$\$(.*?)\$\$',
+        replace_block_formula,
+        text,
+        flags=re.DOTALL
+    )
+    
+    # Инлайн формулы $...$ (но не $$)
+    def replace_inline_formula(match):
+        nonlocal placeholder_counter
+        placeholder = f"__FORMULA_INLINE_{placeholder_counter}__"
+        formula_placeholders[placeholder] = f'<span class="math-inline">{match.group(1)}</span>'
+        placeholder_counter += 1
+        return placeholder
+    
+    text = re.sub(
+        r'(?<!\$)\$([^$\n]+?)\$(?!\$)',
+        replace_inline_formula,
+        text
+    )
+    
+    # Конвертируем Markdown в HTML
+    md = markdown.Markdown(
+        extensions=[
+            'codehilite',
+            'fenced_code',
+            'tables',
+            'nl2br',  # Автоматические переносы строк
+        ],
+        extension_configs={
+            'codehilite': {
+                'css_class': 'highlight',
+                'use_pygments': False,
+            }
+        }
+    )
+    
+    html = md.convert(text)
+    
+    # Восстанавливаем формулы
+    for placeholder, formula_html in formula_placeholders.items():
+        html = html.replace(placeholder, formula_html)
+    
+    return Markup(html)
+
 @app.teardown_appcontext
 def close_db(exception: Optional[BaseException]) -> None:  # noqa: ARG001
     """Closes DB connection at the end of request."""
@@ -243,8 +314,9 @@ def default_chat_state(presets: OrderedDict[str, Dict[str, str]]) -> Dict[str, o
         default_provider=DEFAULT_PROVIDER,
         default_temperature=DEFAULT_TEMPERATURE,
     )
-    # Добавляем use_local_vectors по умолчанию
+    # Добавляем use_local_vectors и rag_threshold по умолчанию
     state["use_local_vectors"] = False
+    state["rag_threshold"] = 0.7
     return state
 
 
@@ -510,6 +582,7 @@ def _create_chat_state(
     model: str,
     history: List[Dict[str, str]] | None = None,
     use_local_vectors: bool = False,
+    rag_threshold: float = 0.7,
 ) -> Dict[str, object]:
     """Создает словарь состояния чата."""
     return {
@@ -519,6 +592,7 @@ def _create_chat_state(
         "model": model,
         "history": history or [],
         "use_local_vectors": use_local_vectors,
+        "rag_threshold": rag_threshold,
     }
 
 
@@ -533,6 +607,7 @@ def _save_session_state(state: Dict[str, object]) -> None:
         "provider": state.get("provider"),
         "model": state.get("model"),
         "use_local_vectors": state.get("use_local_vectors", False),
+        "rag_threshold": state.get("rag_threshold", 0.7),
     }
     
     try:
@@ -567,6 +642,7 @@ def _load_session_state() -> Dict[str, object]:
         "provider": session_state.get("provider"),
         "model": session_state.get("model"),
         "use_local_vectors": session_state.get("use_local_vectors", False),
+        "rag_threshold": session_state.get("rag_threshold", 0.7),
         "history": history,
     }
     
@@ -595,7 +671,7 @@ def _validate_chat_state(
 
 def _parse_form_settings(
     state: Dict[str, object], presets: OrderedDict[str, Dict[str, str]]
-) -> Tuple[str, float, str, str, bool]:
+) -> Tuple[str, float, str, str, bool, float]:
     """Парсит настройки из формы запроса."""
     preset_key = request.form.get("preset") or state["preset_key"]
     if preset_key not in presets:
@@ -620,7 +696,18 @@ def _parse_form_settings(
     # Парсим флаг использования локальных векторов
     use_local_vectors = request.form.get("use_local_vectors") == "on"
 
-    return preset_key, temperature, provider, model, use_local_vectors
+    # Парсим порог релевантности для RAG
+    rag_threshold_str = request.form.get("rag_threshold")
+    if rag_threshold_str:
+        try:
+            rag_threshold = float(rag_threshold_str)
+            rag_threshold = max(0.0, min(1.0, rag_threshold))  # Ограничиваем 0.0-1.0
+        except (ValueError, TypeError):
+            rag_threshold = state.get("rag_threshold", 0.7)
+    else:
+        rag_threshold = state.get("rag_threshold", 0.7)
+
+    return preset_key, temperature, provider, model, use_local_vectors, rag_threshold
 
 
 def _handle_save_preset(
@@ -684,7 +771,7 @@ def index():
 
     if request.method == "POST":
         action = request.form.get("action", "send")
-        preset_key, temperature, provider, model, use_local_vectors = _parse_form_settings(
+        preset_key, temperature, provider, model, use_local_vectors, rag_threshold = _parse_form_settings(
             state, presets
         )
 
@@ -704,6 +791,7 @@ def index():
                     "provider": provider,
                     "model": model,
                     "use_local_vectors": use_local_vectors,
+                    "rag_threshold": rag_threshold,
                 }
             )
             _save_session_state(state)
@@ -712,7 +800,7 @@ def index():
         if action == "reset":
             # Начинаем новый диалог (не удаляя историю предыдущего)
             _start_new_session()
-            state = _create_chat_state(preset_key, temperature, provider, model, use_local_vectors=use_local_vectors)
+            state = _create_chat_state(preset_key, temperature, provider, model, use_local_vectors=use_local_vectors, rag_threshold=rag_threshold)
             _save_session_state(state)
             flash("Начат новый диалог.", "info")
             return redirect(url_for("index"))
@@ -727,18 +815,21 @@ def index():
                     "provider": provider,
                     "model": model,
                     "use_local_vectors": use_local_vectors,
+                    "rag_threshold": rag_threshold,
                 }
             )
             _save_session_state(state)
             return redirect(url_for("index"))
 
-        settings_changed = _check_settings_changed(
-            state, preset_key, provider, temperature, model
-        ) or state.get("use_local_vectors", False) != use_local_vectors
+        settings_changed = (
+            _check_settings_changed(state, preset_key, provider, temperature, model)
+            or state.get("use_local_vectors", False) != use_local_vectors
+            or abs(state.get("rag_threshold", 0.7) - rag_threshold) > 1e-6
+        )
 
         if settings_changed:
             state = _create_chat_state(
-                preset_key, temperature, provider, model, use_local_vectors=use_local_vectors
+                preset_key, temperature, provider, model, use_local_vectors=use_local_vectors, rag_threshold=rag_threshold
             )
         else:
             state.update(
@@ -748,6 +839,7 @@ def index():
                     "provider": provider,
                     "model": model,
                     "use_local_vectors": use_local_vectors,
+                    "rag_threshold": rag_threshold,
                 }
             )
 
@@ -766,6 +858,7 @@ def index():
                     temperature=temperature,
                     model=model,
                     use_local_vectors=use_local_vectors,
+                    rag_threshold=rag_threshold,
                 )
             else:
                 model_meta = AVAILABLE_PROVIDERS[provider]["models"].get(

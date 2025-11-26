@@ -177,7 +177,7 @@ def build_messages_with_context(
     
     Args:
         question: Вопрос пользователя
-        chunks: Список найденных релевантных чанков
+        chunks: Список найденных релевантных чанков (уже отфильтрованных по порогу)
         system_prompt: Исходный системный промпт
         history: История сообщений
         
@@ -189,20 +189,31 @@ def build_messages_with_context(
     context_parts = []
     current_length = 0
     
-    for chunk in chunks:
-        chunk_text = chunk.get("text", "")
-        chunk_path = chunk.get("path", "")
+    # Формируем структурированный контекст с нумерацией и источниками
+    for idx, chunk in enumerate(chunks, 1):
+        chunk_text = chunk.get("text", "").strip()
+        chunk_path = chunk.get("path") or chunk.get("source_file", "")
         chunk_headings = chunk.get("headings", "")
+        chunk_similarity = chunk.get("similarity")
+        chunk_index = chunk.get("chunk_index")
         
-        # Формируем строку чанка с метаданными
-        chunk_str = ""
+        # Формируем заголовок чанка с метаданными
+        chunk_header_parts = [f"--- Фрагмент {idx} ---"]
+        
         if chunk_path:
-            chunk_str += f"[Источник: {chunk_path}]"
+            chunk_header_parts.append(f"Источник: {chunk_path}")
+        if chunk_index is not None:
+            chunk_header_parts.append(f"Индекс: {chunk_index}")
         if chunk_headings:
-            chunk_str += f" {chunk_headings}\n"
-        chunk_str += f"{chunk_text}\n\n"
+            chunk_header_parts.append(f"Заголовок: {chunk_headings}")
+        if chunk_similarity is not None:
+            chunk_header_parts.append(f"Релевантность: {chunk_similarity:.3f}")
+        
+        chunk_header = "\n".join(chunk_header_parts)
+        chunk_str = f"{chunk_header}\n{chunk_text}\n\n"
         
         if current_length + len(chunk_str) > max_context_length:
+            logger.warning(f"Достигнут лимит длины контекста, добавлено {idx-1} из {len(chunks)} чанков")
             break
         
         context_parts.append(chunk_str)
@@ -214,11 +225,19 @@ def build_messages_with_context(
     # Формируем расширенный системный промпт
     enhanced_system_prompt = (
         f"{system_prompt}\n\n"
-        "Отвечай только на основе предоставленного контекста. "
-        "Если в контексте нет информации для ответа, скажи об этом честно. "
-        "Используй информацию из контекста максимально точно.\n\n"
-        "Контекст:\n"
-        f"{context_text}"
+        "=== РЕЛЕВАНТНЫЙ КОНТЕКСТ ИЗ БАЗЫ ЗНАНИЙ ===\n"
+        "Ниже предоставлены релевантные фрагменты из базы знаний, которые могут быть полезны для ответа на вопрос пользователя.\n\n"
+        f"{context_text}\n"
+        "=== КОНЕЦ КОНТЕКСТА ===\n\n"
+        "ИНСТРУКЦИИ ПО ИСПОЛЬЗОВАНИЮ КОНТЕКСТА:\n"
+        "1. Используй предоставленный контекст как основу для ответа, если он релевантен вопросу.\n"
+        "2. Если контекст содержит точную информацию по вопросу - опирайся на неё и ссылайся на источники.\n"
+        "3. Если контекст частично релевантен - используй его как отправную точку и дополняй своими знаниями для полного ответа.\n"
+        "4. Если контекст не релевантен или недостаточен - можешь использовать свои знания, но упомяни об этом.\n"
+        "5. При сопоставлении вопроса с контекстом учитывай возможные синонимы, связанные понятия и контекстный смысл.\n"
+        "6. Стремись дать наиболее полный и точный ответ, комбинируя информацию из контекста и свои знания при необходимости.\n\n"
+        "При ответе указывай источники, когда используешь информацию из предоставленного контекста "
+        "(например: 'Согласно фрагменту 1 из источника X...' или 'На основе данных из базы знаний...')."
     )
     
     # Собираем messages
@@ -275,12 +294,13 @@ def ask_gigachat(
     model: str | None = None,
     enable_tools: bool = True,
     use_local_vectors: bool = False,
+    rag_threshold: float = 0.7,
 ) -> Tuple[str, Dict[str, Optional[int | float]]]:
     """
     Взаимодействие с GigaChat API: формирование сообщений, запрос, метаданные.
     
     Поддерживает автоматическую обработку tool calls (например, weather tool).
-    Поддерживает RAG через локальную векторную базу данных.
+    Поддерживает RAG через локальную векторную базу данных с фильтрацией по порогу релевантности.
     
     Args:
         system_prompt: Системный промпт
@@ -290,6 +310,8 @@ def ask_gigachat(
         model: Модель GigaChat (по умолчанию "GigaChat")
         enable_tools: Включить ли поддержку tools (по умолчанию True)
         use_local_vectors: Использовать ли локальную векторную базу для RAG (по умолчанию False)
+        rag_threshold: Порог релевантности для фильтрации чанков (0.0-1.0, по умолчанию 0.7)
+                      Для cosine similarity: чем меньше score, тем лучше (score < threshold)
         
     Returns:
         Tuple[текст ответа, метаданные]
@@ -312,12 +334,26 @@ def ask_gigachat(
             logger.warning("RAG запрошен, но vector_store недоступен. Продолжаем без RAG.")
         else:
             try:
-                logger.info("Поиск релевантных чанков для RAG...")
+                logger.info(f"Поиск релевантных чанков для RAG (порог: {rag_threshold})...")
                 # Получаем эмбеддинг запроса
                 query_embedding = embed_query(user_message)
                 # Ищем релевантные чанки
-                context_chunks = search_chunks(query_embedding)
-                logger.info(f"Найдено {len(context_chunks)} релевантных чанков")
+                all_chunks = search_chunks(query_embedding)
+                
+                # Фильтруем по порогу релевантности
+                # Для cosine similarity: score < threshold (меньше = лучше)
+                # Преобразуем score в similarity: similarity = 1 - score (для cosine)
+                filtered_chunks = []
+                for chunk in all_chunks:
+                    score = chunk.get("score", 1.0)
+                    # Для cosine: similarity = 1 - score
+                    similarity = 1.0 - score if score <= 1.0 else 0.0
+                    if similarity >= rag_threshold:
+                        chunk["similarity"] = similarity  # Добавляем similarity для отображения
+                        filtered_chunks.append(chunk)
+                
+                context_chunks = filtered_chunks
+                logger.info(f"Найдено {len(all_chunks)} чанков, после фильтрации (threshold={rag_threshold}): {len(context_chunks)}")
             except Exception as e:
                 logger.error(f"Ошибка при поиске чанков для RAG: {e}")
                 # Продолжаем без RAG в случае ошибки
@@ -611,16 +647,20 @@ def ask_gigachat(
             
             # Добавляем информацию об источниках, если использовался RAG
             if use_local_vectors and context_chunks:
-                # Берем первые 3 чанка с наименьшим score (наиболее релевантные)
+                # Берем все использованные чанки (уже отсортированы по релевантности)
                 sources = []
-                for chunk in sorted(context_chunks, key=lambda x: x.get("score", float("inf")))[:3]:
+                for chunk in context_chunks:
                     source_info = {
-                        "path": chunk.get("path", ""),
+                        "path": chunk.get("path") or chunk.get("source_file", ""),
                         "headings": chunk.get("headings", ""),
+                        "similarity": chunk.get("similarity"),
                         "score": chunk.get("score", 0.0),
+                        "chunk_index": chunk.get("chunk_index"),
                     }
                     sources.append(source_info)
                 meta["sources"] = sources
+                meta["rag_threshold"] = rag_threshold
+                meta["chunks_found"] = len(context_chunks)
 
             return message.content or "", meta
         

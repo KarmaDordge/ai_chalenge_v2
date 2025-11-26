@@ -42,7 +42,7 @@
                     <div class="bubble-meta">
                       Архитектор
                     </div>
-                    <div class="bubble-text">{{ (item.content or '') | striptags | replace('\n', '<br>') | safe }}</div>
+                    <div class="bubble-text">{{ (item.content or '') | format_markdown | safe }}</div>
                     {% if item.meta %}
                       <div class="bubble-meta-details">
                         {% if item.meta.provider and item.meta.model and item.meta.provider in providers %}
@@ -70,17 +70,22 @@
                         </div>
                         {% if item.meta.sources %}
                           <div class="meta-row meta-sources">
-                            <span class="meta-label">📚 Источники:</span>
+                            <span class="meta-label">📚 Источники ({{ item.meta.sources | length }}){% if item.meta.rag_threshold is defined %}, порог: {{ item.meta.rag_threshold | float | round(2) }}{% endif %}:</span>
                             <ul class="sources-list">
                               {% for source in item.meta.sources %}
                                 <li>
                                   {% if source.path %}
                                     <span class="source-path">{{ source.path }}</span>
                                   {% endif %}
+                                  {% if source.chunk_index is not none %}
+                                    <span class="source-index">[#{{ source.chunk_index }}]</span>
+                                  {% endif %}
                                   {% if source.headings %}
                                     <span class="source-headings">{{ source.headings }}</span>
                                   {% endif %}
-                                  {% if source.score is defined %}
+                                  {% if source.similarity is defined %}
+                                    <span class="source-similarity">(similarity: {{ source.similarity | float | round(3) }})</span>
+                                  {% elif source.score is defined %}
                                     <span class="source-score">(score: {{ source.score | float | round(4) }})</span>
                                   {% endif %}
                                 </li>
@@ -96,7 +101,7 @@
                     <div class="bubble-meta">
                       Вы
                     </div>
-                    <div class="bubble-text">{{ (item.content or '') | striptags | replace('\n', '<br>') | safe }}</div>
+                    <div class="bubble-text">{{ (item.content or '') | format_markdown | safe }}</div>
                     {% if item.meta %}
                       <div class="bubble-meta-details">
                         {% if item.meta.tokens is not none %}
@@ -124,6 +129,7 @@
           <input type="hidden" name="model" id="composer-model" value="{{ state.model }}">
           <input type="hidden" name="temperature" id="composer-temperature" value="{{ '%.2f'|format(state.temperature) }}">
           <input type="hidden" name="use_local_vectors" id="composer-use-local-vectors" value="{% if state.get('use_local_vectors') %}on{% endif %}">
+          <input type="hidden" name="rag_threshold" id="composer-rag-threshold" value="{{ '%.2f'|format(state.get('rag_threshold', 0.7)) }}">
 
           <div class="composer-input-wrapper">
             <textarea
@@ -205,6 +211,22 @@
                 <span>Использовать локальную базу векторов (RAG)</span>
               </label>
             </div>
+
+            <div class="field" id="rag-threshold-field" style="{% if not state.get('use_local_vectors') %}display: none;{% endif %}">
+              <label for="rag_threshold">Порог релевантности (0.0 - 1.0)</label>
+              <input
+                id="rag_threshold"
+                name="rag_threshold"
+                type="number"
+                class="input"
+                min="0"
+                max="1"
+                step="0.05"
+                value="{{ state.get('rag_threshold', 0.7) | float }}"
+                title="Чанки с similarity ниже этого значения будут отфильтрованы"
+              >
+              <small class="field-hint">Чанки с similarity ниже этого значения будут отфильтрованы</small>
+            </div>
           </div>
 
           <section class="prompt-preview">
@@ -238,6 +260,7 @@
         <input type="hidden" name="model" id="modal-model" value="{{ state.model }}">
         <input type="hidden" name="temperature" id="modal-temperature" value="{{ '%.2f'|format(state.temperature) }}">
         <input type="hidden" name="use_local_vectors" id="modal-use-local-vectors" value="{% if state.get('use_local_vectors') %}on{% endif %}">
+        <input type="hidden" name="rag_threshold" id="modal-rag-threshold" value="{{ '%.2f'|format(state.get('rag_threshold', 0.7)) }}">
 
         <div class="field">
           <label for="modal_preset_title">Название</label>
@@ -306,7 +329,10 @@
     const composerModel = document.getElementById('composer-model');
     const composerTemperature = document.getElementById('composer-temperature');
     const composerUseLocalVectors = document.getElementById('composer-use-local-vectors');
+    const composerRagThreshold = document.getElementById('composer-rag-threshold');
     const useLocalVectorsCheckbox = document.getElementById('use_local_vectors');
+    const ragThresholdField = document.getElementById('rag-threshold-field');
+    const ragThresholdInput = document.getElementById('rag_threshold');
     const composerInput = document.getElementById('composer-message');
     const composerTokens = document.getElementById('composer-tokens');
     const tokensCountSpan = composerTokens ? composerTokens.querySelector('.tokens-count') : null;
@@ -391,6 +417,11 @@
       if (composerUseLocalVectors && useLocalVectorsCheckbox) {
         composerUseLocalVectors.value = useLocalVectorsCheckbox.checked ? 'on' : '';
       }
+      if (composerRagThreshold && ragThresholdInput) {
+        // Убеждаемся, что значение правильно форматируется
+        const thresholdValue = parseFloat(ragThresholdInput.value) || 0.7;
+        composerRagThreshold.value = Math.max(0.0, Math.min(1.0, thresholdValue)).toFixed(2);
+      }
 
       if (modalPresetInput) modalPresetInput.value = presetSelect.value;
       if (modalProviderInput) modalProviderInput.value = providerSelect.value;
@@ -399,6 +430,18 @@
       const modalUseLocalVectors = document.getElementById('modal-use-local-vectors');
       if (modalUseLocalVectors && useLocalVectorsCheckbox) {
         modalUseLocalVectors.value = useLocalVectorsCheckbox.checked ? 'on' : '';
+      }
+      const modalRagThreshold = document.getElementById('modal-rag-threshold');
+      if (modalRagThreshold && ragThresholdInput) {
+        const thresholdValue = parseFloat(ragThresholdInput.value) || 0.7;
+        modalRagThreshold.value = Math.max(0.0, Math.min(1.0, thresholdValue)).toFixed(2);
+      }
+    }
+
+    // Показываем/скрываем поле порога релевантности в зависимости от чекбокса RAG
+    function toggleRagThresholdField() {
+      if (ragThresholdField && useLocalVectorsCheckbox) {
+        ragThresholdField.style.display = useLocalVectorsCheckbox.checked ? 'block' : 'none';
       }
     }
 
@@ -413,8 +456,29 @@
     if (presetSelect) presetSelect.addEventListener('change', syncAll);
     if (modelSelect) modelSelect.addEventListener('change', syncAll);
     if (temperatureInput) temperatureInput.addEventListener('input', syncAll);
-    if (useLocalVectorsCheckbox) useLocalVectorsCheckbox.addEventListener('change', syncAll);
-    if (composerForm) composerForm.addEventListener('submit', syncHiddenFields);
+    if (useLocalVectorsCheckbox) {
+      useLocalVectorsCheckbox.addEventListener('change', () => {
+        toggleRagThresholdField();
+        syncAll();
+      });
+    }
+    if (ragThresholdInput) {
+      ragThresholdInput.addEventListener('input', () => {
+        syncHiddenFields(); // Синхронизируем скрытое поле при изменении
+        syncAll();
+      });
+      ragThresholdInput.addEventListener('change', () => {
+        syncHiddenFields(); // Синхронизируем при потере фокуса
+      });
+    }
+    if (composerForm) {
+      composerForm.addEventListener('submit', (e) => {
+        syncHiddenFields(); // Обязательно синхронизируем перед отправкой
+      });
+    }
+
+    // Инициализация видимости поля порога при загрузке
+    toggleRagThresholdField();
 
     function openPresetModal() {
       if (!presetModalBackdrop) return;
