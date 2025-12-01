@@ -32,6 +32,9 @@ from gigachat import GigaChat
 from gigachat.models import Chat, Messages, MessagesRole
 from huggingface_hub import InferenceClient
 from gigachat_client import ask_gigachat
+from git_utils import get_git_repo_structure
+from repo_config import list_repo_configs, get_repo_config
+from github_tool import github_get_repo_tree
 
 # Утилиты, вынесенные в отдельный модуль
 from chat_utils import (
@@ -64,6 +67,9 @@ from db_utils import (
 
 # Настраиваем переменные окружения
 load_dotenv()
+
+# Настройка логирования
+logger = logging.getLogger(__name__)
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 CONFIG_DIR = os.path.join(BASE_DIR, "config")
@@ -317,6 +323,7 @@ def default_chat_state(presets: OrderedDict[str, Dict[str, str]]) -> Dict[str, o
     # Добавляем use_local_vectors и rag_threshold по умолчанию
     state["use_local_vectors"] = False
     state["rag_threshold"] = 0.7
+    state["repo_config"] = None  # Имя выбранного MD файла конфигурации
     return state
 
 
@@ -583,6 +590,7 @@ def _create_chat_state(
     history: List[Dict[str, str]] | None = None,
     use_local_vectors: bool = False,
     rag_threshold: float = 0.7,
+    repo_config: Optional[str] = None,
 ) -> Dict[str, object]:
     """Создает словарь состояния чата."""
     return {
@@ -593,6 +601,7 @@ def _create_chat_state(
         "history": history or [],
         "use_local_vectors": use_local_vectors,
         "rag_threshold": rag_threshold,
+        "repo_config": repo_config,
     }
 
 
@@ -608,6 +617,7 @@ def _save_session_state(state: Dict[str, object]) -> None:
         "model": state.get("model"),
         "use_local_vectors": state.get("use_local_vectors", False),
         "rag_threshold": state.get("rag_threshold", 0.7),
+        "repo_config": state.get("repo_config"),
     }
     
     try:
@@ -643,9 +653,12 @@ def _load_session_state() -> Dict[str, object]:
         "model": session_state.get("model"),
         "use_local_vectors": session_state.get("use_local_vectors", False),
         "rag_threshold": session_state.get("rag_threshold", 0.7),
+        "repo_config": session_state.get("repo_config"),
         "history": history,
     }
     
+    # MD файл конфигурации теперь используется только для указания репозитория
+    # Настройки RAG управляются только через UI
     return state
 
 
@@ -671,7 +684,7 @@ def _validate_chat_state(
 
 def _parse_form_settings(
     state: Dict[str, object], presets: OrderedDict[str, Dict[str, str]]
-) -> Tuple[str, float, str, str, bool, float]:
+) -> Tuple[str, float, str, str, bool, float, Optional[str]]:
     """Парсит настройки из формы запроса."""
     preset_key = request.form.get("preset") or state["preset_key"]
     if preset_key not in presets:
@@ -707,7 +720,12 @@ def _parse_form_settings(
     else:
         rag_threshold = state.get("rag_threshold", 0.7)
 
-    return preset_key, temperature, provider, model, use_local_vectors, rag_threshold
+    # Парсим выбранный MD файл конфигурации репозитория
+    repo_config = request.form.get("repo_config") or state.get("repo_config")
+    if repo_config == "":
+        repo_config = None
+
+    return preset_key, temperature, provider, model, use_local_vectors, rag_threshold, repo_config
 
 
 def _handle_save_preset(
@@ -771,9 +789,25 @@ def index():
 
     if request.method == "POST":
         action = request.form.get("action", "send")
-        preset_key, temperature, provider, model, use_local_vectors, rag_threshold = _parse_form_settings(
+        preset_key, temperature, provider, model, use_local_vectors, rag_threshold, repo_config = _parse_form_settings(
             state, presets
         )
+        
+        logger.info(f"Настройки после парсинга формы: use_local_vectors={use_local_vectors}, rag_threshold={rag_threshold}, repo_config={repo_config}")
+        
+        # Получаем репозиторий из MD файла конфигурации, если он выбран
+        repository = None
+        if repo_config:
+            config = get_repo_config(repo_config)
+            if config:
+                logger.info(f"Загружена конфигурация {repo_config}: repository={config.get('repository')}")
+                # Получаем репозиторий из конфигурации
+                repository = config.get("repository")
+                logger.info(f"Репозиторий из конфигурации {repo_config}: {repository}")
+            else:
+                logger.warning(f"Конфигурация {repo_config} не найдена")
+        else:
+            logger.info("Конфигурация репозитория не выбрана")
 
         if action == "save_preset":
             success, new_state = _handle_save_preset(
@@ -800,7 +834,7 @@ def index():
         if action == "reset":
             # Начинаем новый диалог (не удаляя историю предыдущего)
             _start_new_session()
-            state = _create_chat_state(preset_key, temperature, provider, model, use_local_vectors=use_local_vectors, rag_threshold=rag_threshold)
+            state = _create_chat_state(preset_key, temperature, provider, model, use_local_vectors=use_local_vectors, rag_threshold=rag_threshold, repo_config=repo_config)
             _save_session_state(state)
             flash("Начат новый диалог.", "info")
             return redirect(url_for("index"))
@@ -816,6 +850,160 @@ def index():
                     "model": model,
                     "use_local_vectors": use_local_vectors,
                     "rag_threshold": rag_threshold,
+                    "repo_config": repo_config,
+                }
+            )
+            _save_session_state(state)
+            return redirect(url_for("index"))
+        
+        # Обработка команды /help
+        if message.startswith("/help"):
+            # Получаем system_prompt из presets
+            system_prompt = presets[preset_key]["prompt"]
+            
+            # Получаем репозиторий из конфигурации MD файла
+            repository = None
+            if repo_config:
+                config = get_repo_config(repo_config)
+                if config:
+                    repository = config.get("repository")
+            
+            # Если репозиторий указан в конфигурации, получаем структуру из GitHub
+            repo_structure_text = ""
+            if repository:
+                try:
+                    # Парсим owner/repo
+                    if "/" in repository:
+                        owner, repo = repository.split("/", 1)
+                        # Получаем структуру репозитория из GitHub
+                        tree_result = github_get_repo_tree(owner, repo, recursive=True)
+                        
+                        if "error" in tree_result:
+                            repo_structure_text = f"Ошибка при получении структуры репозитория {repository}: {tree_result.get('error', 'Неизвестная ошибка')}\n\n"
+                        else:
+                            # Форматируем структуру репозитория
+                            tree_items = tree_result.get("tree", [])
+                            branch = tree_result.get("branch", "main")
+                            
+                            # Строим дерево из путей
+                            tree_dict = {}
+                            for item in tree_items:
+                                path = item.get("path", "")
+                                item_type = item.get("type", "blob")
+                                if path:
+                                    parts = path.split('/')
+                                    current = tree_dict
+                                    for idx, part in enumerate(parts):
+                                        if part not in current:
+                                            # Если это последний элемент пути и это файл, то это файл
+                                            # Иначе это директория
+                                            if idx == len(parts) - 1 and item_type == "blob":
+                                                current[part] = {"type": "blob", "children": {}}
+                                            else:
+                                                current[part] = {"type": "tree", "children": {}}
+                                        current = current[part]["children"]
+                            
+                            # Форматируем дерево в строку
+                            def format_tree_structure(node: dict, prefix: str = "", is_last: bool = True) -> str:
+                                lines = []
+                                items = sorted(node.items())
+                                
+                                for i, (name, data) in enumerate(items):
+                                    is_last_item = i == len(items) - 1
+                                    item_type = data.get("type", "blob")
+                                    type_marker = "/" if item_type == "tree" else ""
+                                    current_prefix = prefix + ("└── " if is_last_item else "├── ")
+                                    lines.append(current_prefix + name + type_marker)
+                                    
+                                    children = data.get("children", {})
+                                    if children:
+                                        next_prefix = prefix + ("    " if is_last_item else "│   ")
+                                        lines.append(format_tree_structure(children, next_prefix, is_last_item))
+                                
+                                return "\n".join(lines)
+                            
+                            structure_tree = format_tree_structure(tree_dict)
+                            repo_structure_text = f"Структура репозитория GitHub: {repository}\nВетка: {branch}\nВсего файлов: {len(tree_items)}\n\n{structure_tree}\n"
+                    else:
+                        repo_structure_text = f"Некорректный формат репозитория: {repository}. Ожидается формат owner/repo\n\n"
+                except Exception as e:
+                    repo_structure_text = f"Ошибка при получении структуры репозитория {repository}: {str(e)}\n\n"
+            
+            # Если репозиторий не указан, используем локальный Git
+            if not repository or not repo_structure_text:
+                git_structure = get_git_repo_structure()
+                repo_structure_text = git_structure
+            
+            # Формируем запрос для GigaChat
+            help_prompt = f"Пользователь запросил структуру проекта командой /help.\n\nПолучена следующая структура проекта:\n\n```\n{repo_structure_text}\n```\n\nПредставь эту структуру проекта в удобном и понятном формате. Опиши основные директории и файлы, их назначение (если возможно определить по названиям). Структурируй информацию так, чтобы пользователю было легко понять организацию проекта."
+            
+            # Отправляем запрос в GigaChat
+            try:
+                if provider == "gigachat":
+                    assistant_text, assistant_meta = ask_gigachat(
+                        system_prompt=system_prompt,
+                        history=state["history"],
+                        user_message=help_prompt,
+                        temperature=temperature,
+                        model=model,
+                        use_local_vectors=False,  # Отключаем RAG для команды /help
+                        rag_threshold=rag_threshold,
+                        repository=repository,
+                    )
+                else:
+                    # Для других провайдеров просто возвращаем структуру
+                    assistant_text = f"```\n{repo_structure_text}\n```"
+                    assistant_meta = {
+                        "provider": provider,
+                        "model": model,
+                        "elapsed": 0.0,
+                        "total_tokens": 0,
+                    }
+            except Exception as exc:
+                # В случае ошибки возвращаем структуру напрямую
+                assistant_text = f"```\n{repo_structure_text}\n```"
+                assistant_meta = {
+                    "provider": provider,
+                    "model": model,
+                    "elapsed": 0.0,
+                    "total_tokens": 0,
+                }
+                flash(f"Не удалось обработать через GigaChat: {exc}", "warning")
+            
+            # Добавляем ответ в историю
+            user_meta = {
+                "tokens": estimate_tokens(message),
+                "request_tokens": estimate_request_tokens(system_prompt, state["history"], help_prompt),
+            }
+            state["history"].append(
+                {"role": "user", "content": message, "meta": user_meta}
+            )
+            
+            assistant_meta["provider"] = provider
+            assistant_meta["model"] = model
+            state["history"].append(
+                {
+                    "role": "assistant",
+                    "content": assistant_text,
+                    "meta": assistant_meta,
+                }
+            )
+            
+            # Сохраняем в БД
+            session_id = _get_session_id()
+            _db_ensure_session(session_id, title="Структура проекта")
+            _db_add_message(session_id, "user", message, user_meta)
+            _db_add_message(session_id, "assistant", assistant_text, assistant_meta)
+            
+            state.update(
+                {
+                    "preset_key": preset_key,
+                    "temperature": temperature,
+                    "provider": provider,
+                    "model": model,
+                    "use_local_vectors": use_local_vectors,
+                    "rag_threshold": rag_threshold,
+                    "repo_config": repo_config,
                 }
             )
             _save_session_state(state)
@@ -825,11 +1013,12 @@ def index():
             _check_settings_changed(state, preset_key, provider, temperature, model)
             or state.get("use_local_vectors", False) != use_local_vectors
             or abs(state.get("rag_threshold", 0.7) - rag_threshold) > 1e-6
+            or state.get("repo_config") != repo_config
         )
 
         if settings_changed:
             state = _create_chat_state(
-                preset_key, temperature, provider, model, use_local_vectors=use_local_vectors, rag_threshold=rag_threshold
+                preset_key, temperature, provider, model, use_local_vectors=use_local_vectors, rag_threshold=rag_threshold, repo_config=repo_config
             )
         else:
             state.update(
@@ -840,6 +1029,7 @@ def index():
                     "model": model,
                     "use_local_vectors": use_local_vectors,
                     "rag_threshold": rag_threshold,
+                    "repo_config": repo_config,
                 }
             )
 
@@ -851,6 +1041,15 @@ def index():
 
         try:
             if provider == "gigachat":
+                # Финальная проверка настроек перед отправкой
+                logger.info("=" * 80)
+                logger.info("ФИНАЛЬНЫЕ НАСТРОЙКИ ПЕРЕД ОТПРАВКОЙ В GIGACHAT:")
+                logger.info(f"  use_local_vectors: {use_local_vectors} (тип: {type(use_local_vectors)})")
+                logger.info(f"  rag_threshold: {rag_threshold}")
+                logger.info(f"  repository: {repository}")
+                logger.info(f"  repo_config: {repo_config}")
+                logger.info("=" * 80)
+                
                 assistant_text, assistant_meta = ask_gigachat(
                     system_prompt=system_prompt,
                     history=state["history"],
@@ -859,6 +1058,7 @@ def index():
                     model=model,
                     use_local_vectors=use_local_vectors,
                     rag_threshold=rag_threshold,
+                    repository=repository,
                 )
             else:
                 model_meta = AVAILABLE_PROVIDERS[provider]["models"].get(
@@ -876,7 +1076,26 @@ def index():
                     mode=mode,
                 )
         except Exception as exc:  # noqa: BLE001
-            flash(f"Не удалось получить ответ: {exc}", "error")
+            error_msg = str(exc)
+            # Улучшаем сообщения об ошибках
+            if "handshake" in error_msg.lower() or "timeout" in error_msg.lower() or "ssl" in error_msg.lower():
+                flash(
+                    f"Ошибка подключения к GigaChat API: таймаут SSL соединения. "
+                    f"Попробуйте повторить запрос через несколько секунд. "
+                    f"Ошибка: {error_msg}",
+                    "error"
+                )
+            elif "connection" in error_msg.lower() or "network" in error_msg.lower():
+                flash(
+                    f"Ошибка сетевого подключения к GigaChat API. "
+                    f"Проверьте интернет-соединение и попробуйте снова. "
+                    f"Ошибка: {error_msg}",
+                    "error"
+                )
+            else:
+                flash(f"Не удалось получить ответ: {error_msg}", "error")
+            
+            logger.error(f"Ошибка при запросе к GigaChat: {exc}", exc_info=True)
             _save_session_state(state)
             return redirect(url_for("index"))
 
@@ -919,6 +1138,8 @@ def index():
         return redirect(url_for("index"))
 
     _save_session_state(state)
+    # Загружаем список доступных конфигураций репозиториев
+    repo_configs = list_repo_configs()
     return render_template(
         "index.html",
         presets=presets,
@@ -926,6 +1147,7 @@ def index():
         state=state,
         history=state["history"],
         models=AVAILABLE_PROVIDERS[state["provider"]]["models"],
+        repo_configs=repo_configs,
     )
 
 
@@ -944,6 +1166,7 @@ def history_view(session_uuid: str):
     presets = load_presets()
     state = default_chat_state(presets)
     state["history"] = messages
+    repo_configs = list_repo_configs()
     return render_template(
         "index.html",
         presets=presets,
@@ -951,6 +1174,7 @@ def history_view(session_uuid: str):
         state=state,
         history=messages,
         models=AVAILABLE_PROVIDERS[state["provider"]]["models"],
+        repo_configs=repo_configs,
     )
 
 

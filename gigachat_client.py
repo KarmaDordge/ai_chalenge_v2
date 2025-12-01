@@ -8,7 +8,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from gigachat import GigaChat
-from gigachat.models import Chat, Messages, MessagesRole
+from gigachat.models import Chat, Messages, MessagesRole, Function, FunctionParameters
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -28,13 +28,73 @@ from weather_tool import (
     get_weather,
 )
 
+# Импорт GitHub tool
+from github_tool import (
+    execute_github_tool,
+    register_github_tools,
+)
+
 # Импорт vector store для RAG
+VECTOR_STORE_AVAILABLE = False
+embed_query = None
+search_chunks = None
+
 try:
     from vector_store import embed_query, search_chunks
     VECTOR_STORE_AVAILABLE = True
-except ImportError:
+    logger.info("vector_store успешно импортирован, RAG доступен")
+except ImportError as e:
     VECTOR_STORE_AVAILABLE = False
-    logger.warning("vector_store не доступен, RAG будет отключен")
+    logger.warning(f"vector_store не доступен, RAG будет отключен: {e}")
+except Exception as e:
+    VECTOR_STORE_AVAILABLE = False
+    logger.error(f"Ошибка при импорте vector_store: {e}", exc_info=True)
+
+
+def convert_openai_tools_to_gigachat_functions(tools: List[Dict[str, Any]]) -> List[Function]:
+    """
+    Конвертирует OpenAI-style tool definitions в GigaChat Function objects.
+
+    Args:
+        tools: Список определений tools в формате OpenAI
+
+    Returns:
+        Список объектов Function для GigaChat
+    """
+    functions = []
+
+    for tool in tools:
+        if tool.get("type") != "function":
+            logger.warning(f"Пропускаем tool типа {tool.get('type')}, ожидается 'function'")
+            continue
+
+        func_def = tool.get("function", {})
+        name = func_def.get("name")
+        description = func_def.get("description", "")
+        parameters = func_def.get("parameters", {})
+
+        if not name:
+            logger.warning(f"Tool без имени, пропускаем: {tool}")
+            continue
+
+        # Создаем FunctionParameters из OpenAI parameters
+        func_params = FunctionParameters(
+            type=parameters.get("type", "object"),
+            properties=parameters.get("properties", {}),
+            required=parameters.get("required", []),
+        )
+
+        # Создаем Function объект
+        giga_function = Function(
+            name=name,
+            description=description,
+            parameters=func_params,
+        )
+
+        functions.append(giga_function)
+        logger.debug(f"Сконвертирована функция: {name}")
+
+    return functions
 
 
 def _extract_city_name(text: str) -> str | None:
@@ -259,18 +319,62 @@ def build_messages_with_context(
     return messages
 
 
+def _execute_function_call(function_call) -> Dict[str, Any]:
+    """
+    Выполняет вызов функции на основе данных из function_call (GigaChat format).
+
+    Args:
+        function_call: Объект FunctionCall от GigaChat API с атрибутами name и arguments
+
+    Returns:
+        dict: Результат выполнения функции
+    """
+    function_name = getattr(function_call, "name", "")
+    arguments_str = getattr(function_call, "arguments", "{}")
+
+    logger.info(f"Executing function: {function_name}")
+    logger.debug(f"Function arguments: {arguments_str}")
+
+    # Обработка weather tool
+    if function_name == "weather":
+        tool_call_for_execution = {
+            "name": "weather",
+            "arguments": arguments_str,
+        }
+        return execute_weather_tool(tool_call_for_execution)
+
+    # Обработка GitHub tools
+    if function_name.startswith("github_"):
+        # Преобразуем в формат, ожидаемый execute_github_tool
+        tool_call_dict = {
+            "function": {
+                "name": function_name,
+                "arguments": arguments_str,
+            }
+        }
+        return execute_github_tool(tool_call_dict)
+
+    # Если функция не найдена, возвращаем ошибку
+    return {
+        "error": f"Неизвестная функция: {function_name}",
+    }
+
+
 def _execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
     """
+    DEPRECATED: Использовалась для старого формата tool_calls.
+    Оставлена для обратной совместимости.
+
     Выполняет вызов tool на основе данных из tool_call.
-    
+
     Args:
         tool_call: Словарь с данными вызова tool от GigaChat API
-        
+
     Returns:
         dict: Результат выполнения tool
     """
     function_name = tool_call.get("function", {}).get("name", "")
-    
+
     # Обработка weather tool
     if function_name == "weather":
         # Преобразуем tool_call в формат, ожидаемый execute_weather_tool
@@ -279,7 +383,11 @@ def _execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
             "arguments": tool_call.get("function", {}).get("arguments", "{}"),
         }
         return execute_weather_tool(tool_call_for_execution)
-    
+
+    # Обработка GitHub tools
+    if function_name.startswith("github_"):
+        return execute_github_tool(tool_call)
+
     # Если tool не найден, возвращаем ошибку
     return {
         "error": f"Неизвестный tool: {function_name}",
@@ -295,6 +403,7 @@ def ask_gigachat(
     enable_tools: bool = True,
     use_local_vectors: bool = False,
     rag_threshold: float = 0.7,
+    repository: Optional[str] = None,
 ) -> Tuple[str, Dict[str, Optional[int | float]]]:
     """
     Взаимодействие с GigaChat API: формирование сообщений, запрос, метаданные.
@@ -312,6 +421,7 @@ def ask_gigachat(
         use_local_vectors: Использовать ли локальную векторную базу для RAG (по умолчанию False)
         rag_threshold: Порог релевантности для фильтрации чанков (0.0-1.0, по умолчанию 0.7)
                       Для cosine similarity: чем меньше score, тем лучше (score < threshold)
+        repository: Репозиторий GitHub в формате owner/repo (опционально)
         
     Returns:
         Tuple[текст ответа, метаданные]
@@ -328,42 +438,84 @@ def ask_gigachat(
         model = "GigaChat"
 
     # Обработка RAG: поиск релевантных чанков, если включен флаг
+    logger.info(f"RAG проверка: use_local_vectors={use_local_vectors}, VECTOR_STORE_AVAILABLE={VECTOR_STORE_AVAILABLE}")
+    logger.info(f"embed_query доступна: {embed_query is not None}, search_chunks доступна: {search_chunks is not None}")
     context_chunks = []
     if use_local_vectors:
+        logger.info("RAG запрошен пользователем")
         if not VECTOR_STORE_AVAILABLE:
             logger.warning("RAG запрошен, но vector_store недоступен. Продолжаем без RAG.")
+        elif embed_query is None or search_chunks is None:
+            logger.error("Функции embed_query или search_chunks не импортированы")
         else:
             try:
                 logger.info(f"Поиск релевантных чанков для RAG (порог: {rag_threshold})...")
+                logger.info(f"Запрос пользователя: {user_message[:100]}...")
+                
                 # Получаем эмбеддинг запроса
-                query_embedding = embed_query(user_message)
+                try:
+                    query_embedding = embed_query(user_message)
+                    logger.info(f"Создан эмбеддинг запроса, размерность: {len(query_embedding)}")
+                except Exception as embed_error:
+                    logger.error(f"Ошибка при создании эмбеддинга: {embed_error}")
+                    logger.error("Проверьте, что Ollama запущен и доступен по адресу из OLLAMA_URL")
+                    logger.error("Или проверьте, что модель эмбеддинга указана в OLLAMA_EMBED_MODEL")
+                    raise RuntimeError(f"Не удалось создать эмбеддинг для RAG: {embed_error}") from embed_error
+                
                 # Ищем релевантные чанки
-                all_chunks = search_chunks(query_embedding)
+                try:
+                    all_chunks = search_chunks(query_embedding)
+                    logger.info(f"Найдено всего чанков: {len(all_chunks)}")
+                except Exception as search_error:
+                    logger.error(f"Ошибка при поиске чанков: {search_error}")
+                    logger.error("Проверьте подключение к PostgreSQL и наличие таблицы chunk_embeddings")
+                    raise RuntimeError(f"Не удалось найти чанки для RAG: {search_error}") from search_error
+                
+                if len(all_chunks) > 0:
+                    logger.info(f"Первый чанк: score={all_chunks[0].get('score', 'N/A')}, path={all_chunks[0].get('path', 'N/A')}")
                 
                 # Фильтруем по порогу релевантности
                 # Для cosine similarity: score < threshold (меньше = лучше)
                 # Преобразуем score в similarity: similarity = 1 - score (для cosine)
                 filtered_chunks = []
-                for chunk in all_chunks:
+                for idx, chunk in enumerate(all_chunks):
                     score = chunk.get("score", 1.0)
                     # Для cosine: similarity = 1 - score
                     similarity = 1.0 - score if score <= 1.0 else 0.0
+                    if idx < 3:  # Логируем первые 3 чанка
+                        logger.info(f"Чанк {idx}: score={score:.4f}, similarity={similarity:.4f}, threshold={rag_threshold}, path={chunk.get('path', 'N/A')}")
                     if similarity >= rag_threshold:
                         chunk["similarity"] = similarity  # Добавляем similarity для отображения
                         filtered_chunks.append(chunk)
                 
                 context_chunks = filtered_chunks
                 logger.info(f"Найдено {len(all_chunks)} чанков, после фильтрации (threshold={rag_threshold}): {len(context_chunks)}")
+                if len(context_chunks) == 0:
+                    logger.warning(f"Все чанки отфильтрованы порогом {rag_threshold}. Попробуйте снизить порог.")
+                    logger.info(f"Примеры score найденных чанков: {[chunk.get('score', 0) for chunk in all_chunks[:5]]}")
+            except RuntimeError as e:
+                # RuntimeError означает критическую ошибку RAG - продолжаем без RAG
+                logger.error(f"Критическая ошибка RAG: {e}. Продолжаем без RAG.")
+                context_chunks = []
             except Exception as e:
-                logger.error(f"Ошибка при поиске чанков для RAG: {e}")
+                logger.error(f"Неожиданная ошибка при поиске чанков для RAG: {e}", exc_info=True)
                 # Продолжаем без RAG в случае ошибки
+                context_chunks = []
+    else:
+        logger.info("RAG не запрошен (use_local_vectors=False)")
 
     # Регистрируем tools, если включены
     tools = None
+    functions = None
     if enable_tools:
         tools = register_weather_tool()
+        tools = register_github_tools(tools)
         logger.info(f"Зарегистрированы tools: {len(tools)} tool(s)")
         logger.debug(f"Tools definition: {json.dumps(tools, ensure_ascii=False, indent=2)}")
+
+        # Конвертируем OpenAI-style tools в GigaChat Function objects
+        functions = convert_openai_tools_to_gigachat_functions(tools)
+        logger.info(f"Сконвертировано в GigaChat functions: {len(functions)} function(s)")
 
     # Формируем messages: если включен RAG, используем build_messages_with_context
     if use_local_vectors and context_chunks:
@@ -375,6 +527,12 @@ def ask_gigachat(
                 tool_func = tool.get("function", {})
                 tools_info += f"- {tool_func.get('name', 'unknown')}: {tool_func.get('description', '')}\n"
             enhanced_system_prompt = system_prompt + tools_info
+        
+        # Добавляем информацию о репозитории, если указана
+        if repository:
+            repo_info = f"\n\nРабота с репозиторием GitHub: {repository}\n"
+            repo_info += "При использовании GitHub инструментов используй этот репозиторий по умолчанию, если пользователь не указал другой.\n"
+            enhanced_system_prompt = enhanced_system_prompt + repo_info
         
         messages = build_messages_with_context(
             question=user_message,
@@ -392,6 +550,12 @@ def ask_gigachat(
                 tool_func = tool.get("function", {})
                 tools_info += f"- {tool_func.get('name', 'unknown')}: {tool_func.get('description', '')}\n"
             enhanced_system_prompt = system_prompt + tools_info
+        
+        # Добавляем информацию о репозитории, если указана
+        if repository:
+            repo_info = f"\n\nРабота с репозиторием GitHub: {repository}\n"
+            repo_info += "При использовании GitHub инструментов используй этот репозиторий по умолчанию, если пользователь не указал другой.\n"
+            enhanced_system_prompt = enhanced_system_prompt + repo_info
         
         messages: List[Messages] = [
             Messages(role=MessagesRole.SYSTEM, content=enhanced_system_prompt),
@@ -449,18 +613,24 @@ def ask_gigachat(
         iteration = 0
         
         while iteration < max_iterations:
-            # Логируем структуру tools перед отправкой
-            if tools:
-                logger.info(f"Отправка запроса с {len(tools)} tool(s)")
-                logger.debug(f"Tools structure: {json.dumps(tools, ensure_ascii=False, indent=2)}")
-            
-            chat = Chat(
-                messages=messages,
-                model=model,
-                temperature=temperature,
-                flags=["no_cache"],
-                tools=tools if tools else None,
-            )
+            # Логируем структуру functions перед отправкой
+            if functions:
+                logger.info(f"Отправка запроса с {len(functions)} function(s)")
+                logger.debug(f"Functions: {[f.name for f in functions]}")
+
+            # Создаем Chat с functions вместо tools
+            chat_params = {
+                "messages": messages,
+                "model": model,
+                "temperature": temperature,
+                "flags": ["no_cache"],
+            }
+
+            if functions:
+                chat_params["functions"] = functions
+                chat_params["function_call"] = "auto"
+
+            chat = Chat(**chat_params)
             
             # Логируем структуру Chat объекта
             logger.debug(f"Chat object: messages={len(messages)}, model={model}, tools={tools is not None}")
@@ -482,68 +652,59 @@ def ask_gigachat(
                 if tt is not None:
                     total_tokens_sum += tt
             
-            message = response.choices[0].message
-            
+            choice = response.choices[0]
+            message = choice.message
+
             # Логируем структуру ответа для отладки
             logger.debug(f"Response message type: {type(message)}")
             logger.debug(f"Response message attributes: {dir(message)}")
             logger.debug(f"Response message content: {getattr(message, 'content', None)}")
-            
-            # Проверяем, есть ли tool calls в ответе
-            # Проверяем разные возможные атрибуты для tool calls
-            tool_calls = None
-            if hasattr(message, "tool_calls"):
-                tool_calls = getattr(message, "tool_calls", None)
-            elif hasattr(message, "function_calls"):
-                tool_calls = getattr(message, "function_calls", None)
-            elif hasattr(message, "tool_calls_list"):
-                tool_calls = getattr(message, "tool_calls_list", None)
-            
-            # Также проверяем, может быть tool_calls в виде словаря
-            if tool_calls is None:
-                message_dict = message.__dict__ if hasattr(message, "__dict__") else {}
-                tool_calls = message_dict.get("tool_calls") or message_dict.get("function_calls")
-            
-            logger.info(f"Tool calls found: {tool_calls is not None}, count: {len(tool_calls) if tool_calls else 0}")
-            
-            if tool_calls:
-                logger.debug(f"Tool calls structure: {tool_calls}")
-                logger.debug(f"Tool calls type: {type(tool_calls)}")
-                logger.info(f"Выполняется {len(tool_calls)} tool call(s)")
-            
-            if tool_calls and len(tool_calls) > 0:
-                # Добавляем ответ ассистента с tool calls в историю
+
+            # GigaChat использует finish_reason == "function_call" для определения вызова функции
+            finish_reason = getattr(choice, "finish_reason", None)
+            logger.debug(f"Finish reason: {finish_reason}")
+
+            # Проверяем наличие function_call в ответе
+            function_call = None
+            if finish_reason == "function_call":
+                function_call = getattr(message, "function_call", None)
+                logger.info(f"Function call detected: {function_call}")
+                if function_call:
+                    logger.debug(f"Function call type: {type(function_call)}")
+                    logger.debug(f"Function call attributes: {dir(function_call)}")
+
+            # Если есть function_call, выполняем функцию
+            if function_call:
+                # Добавляем сообщение ассистента с function_call в историю
+                # ВАЖНО: передаем function_call в Messages, чтобы GigaChat знал о вызове функции
                 messages.append(Messages(
                     role=MessagesRole.ASSISTANT,
                     content=message.content or "",
-                    tool_calls=tool_calls,
+                    function_call=function_call,
                 ))
-                
-                # Выполняем все tool calls
-                for tool_call in tool_calls:
-                    logger.info(f"Выполняется tool call: {json.dumps(tool_call, ensure_ascii=False, indent=2)}")
-                    tool_result = _execute_tool_call(tool_call)
-                    logger.info(f"Результат tool call: {json.dumps(tool_result, ensure_ascii=False, indent=2)}")
-                    
-                    # Преобразуем результат в строку JSON
-                    tool_result_str = json.dumps(tool_result, ensure_ascii=False)
-                    
-                    # Добавляем результат tool в историю
-                    # GigaChat использует MessagesRole.FUNCTION для результатов tools
-                    tool_call_id = tool_call.get("id", "")
-                    messages.append(Messages(
-                        role=MessagesRole.FUNCTION,
-                        content=tool_result_str,
-                        tool_call_id=tool_call_id,
-                    ))
-                
+
+                # Выполняем функцию
+                logger.info(f"Выполняется function call: {function_call.name}")
+                function_result = _execute_function_call(function_call)
+                logger.info(f"Результат function call: {json.dumps(function_result, ensure_ascii=False, indent=2)}")
+
+                # Преобразуем результат в строку JSON
+                function_result_str = json.dumps(function_result, ensure_ascii=False)
+
+                # Добавляем результат функции в историю
+                # GigaChat использует MessagesRole.FUNCTION для результатов функций
+                messages.append(Messages(
+                    role=MessagesRole.FUNCTION,
+                    content=function_result_str,
+                ))
+
                 # Продолжаем цикл, чтобы получить финальный ответ от модели
                 iteration += 1
                 continue
             
-            # Если нет tool calls, но у нас уже есть данные о погоде из исходного сообщения,
+            # Если нет function_call, но у нас уже есть данные о погоде из исходного сообщения,
             # возвращаем только температуру
-            if not tool_calls and weather_data and "error" not in weather_data:
+            if not function_call and weather_data and "error" not in weather_data:
                 # Используем название города, если оно было определено ранее
                 if city_name_for_response:
                     final_content = f"Температура в {city_name_for_response}: {weather_data.get('temperature', 'N/A')}°C"
@@ -572,9 +733,9 @@ def ask_gigachat(
                 
                 return final_content, meta
             
-            # Если нет tool calls, проверяем, не упоминает ли модель weather в ответе
+            # Если нет function_call, проверяем, не упоминает ли модель weather в ответе
             # Если да, пытаемся извлечь координаты и вызвать tool вручную
-            if not tool_calls and enable_tools and tools:
+            if not function_call and enable_tools and tools:
                 content = message.content or ""
                 # Проверяем, упоминает ли модель weather tool
                 if "weather" in content.lower() or "погод" in content.lower():

@@ -130,6 +130,7 @@
           <input type="hidden" name="temperature" id="composer-temperature" value="{{ '%.2f'|format(state.temperature) }}">
           <input type="hidden" name="use_local_vectors" id="composer-use-local-vectors" value="{% if state.get('use_local_vectors') %}on{% endif %}">
           <input type="hidden" name="rag_threshold" id="composer-rag-threshold" value="{{ '%.2f'|format(state.get('rag_threshold', 0.7)) }}">
+          <input type="hidden" name="repo_config" id="composer-repo-config" value="{{ state.get('repo_config', '') }}">
 
           <div class="composer-input-wrapper">
             <textarea
@@ -226,6 +227,19 @@
                 title="Чанки с similarity ниже этого значения будут отфильтрованы"
               >
               <small class="field-hint">Чанки с similarity ниже этого значения будут отфильтрованы</small>
+            </div>
+
+            <div class="field">
+              <label for="repo_config">Конфигурация репозитория</label>
+              <select id="repo_config" name="repo_config" class="input">
+                <option value="">Без конфигурации</option>
+                {% for config in repo_configs %}
+                  <option value="{{ config.name }}" {% if state.get('repo_config') == config.name %}selected{% endif %}>
+                    {{ config.name }}{% if config.repository %} ({{ config.repository }}){% endif %}
+                  </option>
+                {% endfor %}
+              </select>
+              <small class="field-hint">Выберите MD файл с настройками репозитория и RAG</small>
             </div>
           </div>
 
@@ -330,9 +344,11 @@
     const composerTemperature = document.getElementById('composer-temperature');
     const composerUseLocalVectors = document.getElementById('composer-use-local-vectors');
     const composerRagThreshold = document.getElementById('composer-rag-threshold');
+    const composerRepoConfig = document.getElementById('composer-repo-config');
     const useLocalVectorsCheckbox = document.getElementById('use_local_vectors');
     const ragThresholdField = document.getElementById('rag-threshold-field');
     const ragThresholdInput = document.getElementById('rag_threshold');
+    const repoConfigSelect = document.getElementById('repo_config');
     const composerInput = document.getElementById('composer-message');
     const composerTokens = document.getElementById('composer-tokens');
     const tokensCountSpan = composerTokens ? composerTokens.querySelector('.tokens-count') : null;
@@ -422,6 +438,9 @@
         const thresholdValue = parseFloat(ragThresholdInput.value) || 0.7;
         composerRagThreshold.value = Math.max(0.0, Math.min(1.0, thresholdValue)).toFixed(2);
       }
+      if (composerRepoConfig && repoConfigSelect) {
+        composerRepoConfig.value = repoConfigSelect.value || '';
+      }
 
       if (modalPresetInput) modalPresetInput.value = presetSelect.value;
       if (modalProviderInput) modalProviderInput.value = providerSelect.value;
@@ -469,6 +488,31 @@
       });
       ragThresholdInput.addEventListener('change', () => {
         syncHiddenFields(); // Синхронизируем при потере фокуса
+      });
+    }
+    if (repoConfigSelect) {
+      repoConfigSelect.addEventListener('change', () => {
+        // Применяем настройки из выбранной конфигурации
+        const selectedConfig = repoConfigSelect.value;
+        if (selectedConfig) {
+          // Находим конфигурацию в данных
+          const repoConfigs = {{ repo_configs | tojson | safe }};
+          const config = repoConfigs.find(c => c.name === selectedConfig);
+          if (config) {
+            // Применяем настройки RAG из конфигурации
+            if (config.rag_enabled && useLocalVectorsCheckbox) {
+              useLocalVectorsCheckbox.checked = true;
+              toggleRagThresholdField();
+            }
+            if (config.rag_threshold !== undefined && ragThresholdInput) {
+              ragThresholdInput.value = config.rag_threshold;
+            }
+          }
+        } else {
+          // Если конфигурация не выбрана, можно сбросить RAG (опционально)
+          // Или оставить текущие настройки
+        }
+        syncAll();
       });
     }
     if (composerForm) {

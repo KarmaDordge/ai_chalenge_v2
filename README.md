@@ -7,6 +7,9 @@
 - **Веб-чат**: удобный интерфейс чата с современным UI (`templates/index.html`, `static/styles.css`).
 - **Два провайдера**: переключение между GigaChat и моделями Hugging Face.
 - **RAG (Retrieval-Augmented Generation)**: поддержка локальной векторной базы данных PostgreSQL с pgvector для контекстного поиска релевантных чанков.
+- **Function Calling (Tools)**: интеграция внешних инструментов через GigaChat tools API.
+  - **Weather Tool**: получение данных о погоде по координатам
+  - **GitHub Tool**: работа с GitHub API (репозитории, issues, PR, файлы, поиск)
 - **История сессий**: сохранение диалогов в SQLite (`chat_history/chat_history.db`) и просмотр истории через отдельную страницу.
 - **Предустановки промптов**: хранение системных промптов (presets) в базе данных, создание новых через UI.
 - **Метаданные запросов**: отображение токенов, времени ответа и примерной стоимости запросов GigaChat.
@@ -47,6 +50,9 @@ GIGACHAT_CREDENTIALS=your_credentials_here
 
 # Опциональные
 HUGGINGFACE_API_TOKEN=your_hf_token_here
+
+# Для GitHub Tool (опционально)
+GITHUB_TOKEN=your_github_personal_access_token_here
 
 # Для RAG (опционально)
 DATABASE_URL=postgresql://user:pass@host:port/db
@@ -105,18 +111,41 @@ python chatbot_gui.py
   - работа с предустановками: `db_load_presets()`, `db_upsert_preset()`, `make_unique_preset_key()`;
   - обслуживание WAL: `db_wal_checkpoint()`.
 
-- **`gigachat_client.py`**  
+- **`gigachat_client.py`**
   Обёртка над SDK GigaChat:
   - `ask_gigachat()` формирует список сообщений (`system + history + user`),
     отправляет запрос через `GigaChat`, извлекает usage и считает стоимость.
   - Поддержка RAG: при `use_local_vectors=True` ищет релевантные чанки через `vector_store`
     и формирует контекст через `build_messages_with_context()`.
+  - Поддержка Function Calling: регистрация и выполнение tools (weather, GitHub).
 
-- **`vector_store.py`**  
+- **`vector_store.py`**
   Модуль для работы с векторной базой данных PostgreSQL (pgvector):
   - `init_pg()` — создание соединения с БД;
   - `embed_query()` — создание эмбеддинга запроса через Ollama API;
   - `search_chunks()` — поиск top-k релевантных чанков по cosine similarity.
+
+- **`weather_tool.py`**
+  Инструмент для получения данных о погоде:
+  - `get_weather()` — запрос погоды по координатам;
+  - `register_weather_tool()` — регистрация tool для GigaChat;
+  - `execute_weather_tool()` — выполнение вызова tool;
+  - интеграция с локальным MCP сервером (http://localhost:8080).
+
+- **`github_tool.py`**
+  Инструмент для работы с GitHub API (12 функций):
+  - **Репозитории**: получение информации о репозитории
+  - **Issues**: список, создание, обновление, комментарии
+  - **Pull Requests**: список, детали PR
+  - **Файлы и структура**:
+    - `github_list_repo_contents()` — список файлов в директории
+    - `github_get_repo_tree()` — полное дерево репозитория
+    - `github_get_file_content()` — содержимое конкретного файла
+  - **Поиск**: поиск кода в GitHub
+  - **Коммиты**: список коммитов в репозитории
+  - **Пользователи**: информация о пользователях GitHub
+  - `register_github_tools()` — регистрация всех GitHub tools для GigaChat;
+  - `execute_github_tool()` — выполнение вызовов GitHub tools.
 
 - **`templates/index.html`**  
   Основной шаблон чата:
@@ -228,12 +257,24 @@ python chatbot_gui.py
   - включить checkbox "Использовать локальную базу векторов (RAG)" в UI;
   - при включенном флаге ответы будут содержать контекст из найденных чанков и список источников.
 
+- **Настроить GitHub Tool**:
+  - создать Personal Access Token на https://github.com/settings/tokens;
+  - добавить `GITHUB_TOKEN` в `.env` файл;
+  - GitHub tool автоматически доступен в GigaChat через function calling;
+  - примеры использования: "Покажи информацию о репозитории octocat/Hello-World", "Создай issue в моем репозитории", "Найди файл README.md в репозитории".
+
 - **Изменить UI**:
   - править разметку в `templates/index.html` и стили в `static/styles.css`.
 
 - **Добавить новые типы метаданных**:
   - расширить `create_meta_dict()` в `chat_utils.py`;
   - убедиться, что шаблон `index.html` корректно отображает новые поля `meta`.
+
+- **Добавить новые Tools**:
+  - создать новый файл `your_tool.py` по аналогии с `weather_tool.py` или `github_tool.py`;
+  - определить функции и tool definitions в формате OpenAI function calling;
+  - зарегистрировать tool в `gigachat_client.py` через `register_your_tool()`;
+  - добавить обработку в `_execute_tool_call()` функцию.
 
 ---
 
@@ -244,6 +285,168 @@ python chatbot_gui.py
   - Flask‑роуты и HTTP‑логика — в `chatbot_gui.py`;
   - работа с БД — в `db_utils.py`;
   - общие утилиты и расчёты — в `chat_utils.py`;
-  - интеграция с GigaChat — в `gigachat_client.py`.
+  - интеграция с GigaChat — в `gigachat_client.py`;
+  - tools (weather, GitHub) — в отдельных модулях.
 - **Прозрачность данных**: история и настройки легко читаются/расширяются в SQLite и cookie‑сессии.
-- **Готовность к расширению**: добавление новых моделей, типов провайдеров и UI‑функций с минимальными изменениями в существующем коде.
+- **Готовность к расширению**: добавление новых моделей, типов провайдеров, tools и UI‑функций с минимальными изменениями в существующем коде.
+
+---
+
+## GitHub Tool — работа с GitHub API
+
+### Возможности
+
+GitHub Tool предоставляет интеграцию с GitHub API через GigaChat function calling. Все операции выполняются автоматически при упоминании GitHub в диалоге.
+
+#### Поддерживаемые операции:
+
+1. **Репозитории** (`github_get_repo`)
+   - Получение информации о репозитории (описание, звезды, форки, язык)
+   - Пример: "Покажи информацию о репозитории octocat/Hello-World"
+
+2. **Issues** (`github_list_issues`, `github_get_issue`, `github_create_issue`, `github_update_issue`)
+   - Список issues с фильтрацией по статусу и меткам
+   - Просмотр детальной информации об issue
+   - Создание новых issues
+   - Обновление существующих issues (заголовок, описание, статус)
+   - Примеры:
+     - "Покажи открытые issues в репозитории username/repo"
+     - "Создай issue 'Bug in login' в репозитории myrepo с описанием 'Users can't login'"
+
+3. **Комментарии** (`github_create_comment`)
+   - Добавление комментариев к issues и pull requests
+   - Пример: "Добавь комментарий 'Fixed in PR #123' к issue #45 в репозитории username/repo"
+
+4. **Структура репозитория** (НОВОЕ!)
+   - `github_list_repo_contents` — список файлов и папок в директории
+     - Пример: "Покажи файлы в корне репозитория username/repo"
+     - Пример: "Что находится в папке src/ репозитория username/repo"
+   - `github_get_repo_tree` — полное дерево репозитория
+     - Получение всей структуры файлов рекурсивно
+     - Пример: "Покажи структуру репозитория facebook/react"
+     - Пример: "Какие файлы есть в репозитории torvalds/linux"
+
+5. **Pull Requests** (`github_list_pull_requests`)
+   - Список pull requests с фильтрацией по статусу
+   - Пример: "Покажи открытые PR в репозитории username/repo"
+
+6. **Файлы** (`github_get_file_content`)
+   - Получение содержимого файлов из репозитория
+   - Поддержка разных веток
+   - Автоматическое декодирование base64
+   - Пример: "Покажи содержимое файла README.md из репозитория octocat/Hello-World"
+
+7. **Поиск кода** (`github_search_code`)
+   - Глобальный поиск кода в GitHub
+   - Поддержка фильтрации по языку, репозиторию
+   - Пример: "Найди код 'async function' в репозитории username/repo на языке TypeScript"
+
+8. **Коммиты** (`github_list_commits`)
+   - Список коммитов в репозитории
+   - Поддержка фильтрации по ветке
+   - Пример: "Покажи последние 10 коммитов в репозитории username/repo"
+
+9. **Пользователи** (`github_get_user_info`)
+   - Информация о пользователях GitHub
+   - Информация о текущем авторизованном пользователе
+   - Пример: "Покажи информацию о пользователе octocat"
+
+### Настройка
+
+1. **Создание Personal Access Token**:
+   - Перейдите на https://github.com/settings/tokens
+   - Нажмите "Generate new token" → "Generate new token (classic)"
+   - Выберите scopes (права доступа):
+     - `repo` — полный доступ к репозиториям
+     - `read:user` — чтение информации о пользователе
+     - `user:email` — доступ к email
+   - Скопируйте сгенерированный токен
+
+2. **Добавление токена в проект**:
+   ```bash
+   # В файле .env добавьте:
+   GITHUB_TOKEN=ghp_your_personal_access_token_here
+   ```
+
+3. **Проверка работы**:
+   ```bash
+   # Запустите тестовый скрипт
+   python github_tool.py
+   ```
+
+### Примеры использования в чате
+
+```
+Пользователь: Покажи мне информацию о репозитории torvalds/linux
+
+GigaChat: [автоматически вызывает github_get_repo("torvalds", "linux")]
+         Репозиторий Linux kernel от Linus Torvalds:
+         - Звезды: 180K+
+         - Форки: 50K+
+         - Язык: C
+         - Описание: Linux kernel source tree
+```
+
+```
+Пользователь: Создай issue в моем репозитории username/myproject с заголовком "Add tests" и описанием "Need unit tests for auth module"
+
+GigaChat: [автоматически вызывает github_create_issue(...)]
+         Issue успешно создан! #42: "Add tests"
+         URL: https://github.com/username/myproject/issues/42
+```
+
+```
+Пользователь: Найди все файлы с функциями async в репозитории microsoft/TypeScript
+
+GigaChat: [автоматически вызывает github_search_code("repo:microsoft/TypeScript async function")]
+         Найдено 150+ результатов:
+         1. src/compiler/checker.ts - async function checkAsync()
+         2. src/server/session.ts - async function executeCommand()
+         ...
+```
+
+### Безопасность
+
+- **Токен хранится только локально** в `.env` файле
+- Токен **не логируется** и не отображается в UI
+- Используется **HTTPS** для всех запросов к GitHub API
+- Поддержка **rate limiting** GitHub API (5000 запросов/час для авторизованных пользователей)
+
+### Ограничения
+
+- Требуется валидный Personal Access Token с соответствующими правами
+- Rate limits GitHub API: 5000 запросов/час (авторизованные), 60 запросов/час (неавторизованные)
+- Некоторые операции требуют прав записи в репозиторий (создание issues, PR)
+- Search API имеет дополнительные ограничения: 30 запросов/минуту
+
+### Расширение функционала
+
+Для добавления новых операций GitHub API:
+
+1. Добавьте новую функцию в [github_tool.py](github_tool.py):
+   ```python
+   def github_new_operation(param1: str, param2: int) -> Dict[str, Any]:
+       """Описание операции."""
+       return _make_github_request("GET", f"/endpoint/{param1}/{param2}")
+   ```
+
+2. Добавьте tool definition в `GITHUB_TOOLS_DEFINITIONS`:
+   ```python
+   {
+       "type": "function",
+       "function": {
+           "name": "github_new_operation",
+           "description": "Описание для GigaChat",
+           "parameters": {
+               "type": "object",
+               "properties": {
+                   "param1": {"type": "string", "description": "..."},
+                   "param2": {"type": "integer", "description": "..."}
+               },
+               "required": ["param1", "param2"]
+           }
+       }
+   }
+   ```
+
+3. Добавьте обработку в `execute_github_tool()` (автоматически через `function_map`)

@@ -116,9 +116,20 @@ def embed_query(query_text: str) -> List[float]:
         
         logger.info(f"Создан эмбеддинг размерности {len(embedding)}")
         return embedding
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"Не удалось подключиться к Ollama по адресу {ollama_url}: {e}")
+        logger.error("Убедитесь, что Ollama запущен: ollama serve")
+        raise RuntimeError(f"Ollama недоступен по адресу {ollama_url}. Запустите Ollama: ollama serve") from e
+    except requests.exceptions.Timeout as e:
+        logger.error(f"Таймаут при запросе к Ollama: {e}")
+        raise RuntimeError(f"Таймаут при запросе к Ollama. Проверьте, что Ollama работает и модель {model} доступна") from e
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"HTTP ошибка от Ollama: {e}")
+        logger.error(f"Проверьте, что модель {model} установлена: ollama pull {model}")
+        raise RuntimeError(f"Ошибка от Ollama API. Проверьте, что модель {model} установлена: ollama pull {model}") from e
     except Exception as e:
-        logger.error(f"Ошибка при создании эмбеддинга: {e}")
-        raise RuntimeError(f"Не удалось создать эмбеддинг: {e}")
+        logger.error(f"Ошибка при создании эмбеддинга: {e}", exc_info=True)
+        raise RuntimeError(f"Не удалось создать эмбеддинг: {e}") from e
 
 
 def search_chunks(
